@@ -11,8 +11,8 @@ DOCKER_RUN := docker run --rm \
     -v $(PWD)/findings:/work/findings \
     -v $(PWD)/findings-qemu:/work/findings-qemu
 
-.PHONY: build shell fuzz fuzz-qemu fuzz-persistent fuzz-no-san \
-        plot plot-qemu sanity clean distclean help
+.PHONY: build build-synthetic shell fuzz fuzz-qemu fuzz-persistent fuzz-no-san \
+        fuzz-synthetic plot plot-qemu sanity clean distclean help
 
 help:
 	@echo "make build           build the docker image"
@@ -29,6 +29,18 @@ help:
 
 build:
 	docker build -t $(IMAGE) .
+
+# Q5 fallback build: layered image with synthetic_bug.patch applied.
+build-synthetic: build
+	docker build -f Dockerfile.synthetic -t $(IMAGE)-synthetic .
+
+# Q5 fallback fuzz: 60 seconds is enough for AFL++ to splice in tEXt and crash.
+fuzz-synthetic:
+	mkdir -p findings-synthetic
+	docker run --rm -it \
+	    -v $(PWD)/findings-synthetic:/work/findings \
+	    $(IMAGE)-synthetic \
+	    afl-fuzz -i seeds -o findings -x $(DICT) -V 60 -- ./png_fuzz @@
 
 shell:
 	$(DOCKER_RUN) -it $(IMAGE)
@@ -79,7 +91,7 @@ plot-qemu:
 
 clean:
 	rm -rf findings findings-qemu findings-persistent findings-no-san \
-	       plot_output plot_output_qemu
+	       findings-synthetic plot_output plot_output_qemu
 
 distclean: clean
-	-docker image rm $(IMAGE)
+	-docker image rm $(IMAGE) $(IMAGE)-synthetic

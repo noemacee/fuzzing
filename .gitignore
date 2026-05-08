@@ -29,6 +29,9 @@ libpng-*.tar.gz
 # AFL++ outputs (huge, regenerated each run)
 findings/
 findings-qemu/
+findings-persistent/
+findings-no-san/
+findings-synthetic/
 plot_output/
 plot_output_qemu/
 
