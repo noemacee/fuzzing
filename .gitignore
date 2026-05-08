@@ -1,0 +1,47 @@
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.lo
+*.la
+*.dylib
+.deps/
+.libs/
+
+# libpng source tree (we download it in the Dockerfile)
+libpng-*/
+libpng-*.tar.gz
+
+# AFL++ outputs (huge, regenerated each run)
+findings/
+findings-qemu/
+plot_output/
+plot_output_qemu/
+
+# Harness binaries
+png_fuzz
+png_fuzz_qemu
+png_fuzz_persistent
+
+# Local install prefixes
+install/
+install_vanilla/
+
+# Latex aux
+*.aux
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
+*.synctex.gz
