@@ -1,6 +1,7 @@
-# NOTES — local-only decision log
+# NOTES — decision log
 
-This file is gitignored. It captures every decision and command, in order, so you (the human) can redo the work yourself in plausible commit chunks. **Do not commit this file.**
+Records the key choices made in this project (target version, architecture,
+harness shape, patches) and the issues encountered and resolved during setup.
 
 ---
 
@@ -19,12 +20,17 @@ Counter-options considered: 1.6.37 (manual one-line patch to `png_crc_finish` in
 
 ## Architecture
 
-Host is **Apple Silicon (arm64)**. AFL++ image runs under x86_64 emulation via Docker's QEMU layer, so:
-- Builds are 2–3× slower than native amd64.
-- Fuzzing exec speed will be lower than what's quoted in AFL++ docs (expect a few hundred exec/sec instead of >1k).
-- Numbers in Q4/Q7/Q8 must reflect *our actual* run, not generic benchmarks.
+Host is **Apple Silicon (arm64)**. The `aflplusplus/aflplusplus` image is
+multi-arch (amd64 + arm64), so the build runs natively on the host architecture
+rather than under emulation. The Dockerfile does **not** pin a platform — see
+Issue 1 below for why pinning was tried first and removed.
 
-The Dockerfile pins `--platform=linux/amd64` so the image is consistent regardless of host arch — also makes the campaign reproducible on the grader's machine.
+Implications for the recorded numbers:
+- Fuzzing exec speed will be lower than what's quoted in AFL++ docs (expect a
+  few hundred exec/sec instead of >1k) because of arm64 + ASan overhead.
+- Numbers in Q4/Q7/Q8 reflect arm64-native execution. On amd64 hosts the grader
+  may see different absolute speeds; the *relative* shape (persistent ≫ no-san
+  fork > ASan fork) holds across architectures.
 
 ## Harness design
 

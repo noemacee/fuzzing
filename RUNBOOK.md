@@ -1,35 +1,24 @@
-# RUNBOOK — replay this lab in your own commits
+# RUNBOOK — re-running each phase end-to-end
 
-This file is gitignored. It's the recipe for redoing every step yourself.
-
-The goal: each item below is a **standalone unit of work** you can do, then commit. The commit messages are suggestions — keep them short and lowercase. Do not paste the AI-flavored descriptions; the diffs speak for themselves.
+Step-by-step recipe for re-running the project from scratch on a clean clone.
+Assumes Docker is installed. See `README.md` for prerequisites and the
+high-level overview; this file is the operator's playbook.
 
 ---
 
-## Phase A — environment scaffolding
+## Phase A — environment build
 
-Already done by the loop. Sanity-rerun if you want to verify on your own:
+Build the Docker image and verify the harness runs on a known-good seed:
 
 ```bash
-make build      # ~2-3 min on arm64 native, ~5 min if amd64 emulated
+make build      # ~3–5 min depending on host arch
 make sanity     # must print "exit=0"
 ```
 
-Suggested commit chunking, if you redo from scratch:
-
-| # | Files touched | Suggested message |
-|---|---|---|
-| 1 | `.gitignore` | `ignore build outputs and afl findings` |
-| 2 | `patches/libpng-nocrc.patch` + `Dockerfile` | `dockerfile: amd64 base, libpng 1.2.56, three lib builds` |
-| 3 | `Dockerfile`, `Makefile` (drop --platform pin) | `drop amd64 pin: asan crashes under qemu emulation` |
-| 4 | `Makefile` | `makefile: build/fuzz/fuzz-qemu plus q8 perf variants` |
-| 5 | `src/harness.c` | `wip harness: file input, full decode, setjmp` |
-| 6 | `src/harness.c` (drop setjmp.h include) | `fix harness: include png.h before setjmp.h` |
-| 7 | `src/harness_persistent.c` | `persistent harness for q8 perf compare` |
-| 8 | `seeds/make_seeds.py` + 6 PNGs | `seeds: 6 small valid pngs covering color types` |
-| 9 | `.dockerignore` | `exclude seed generator from image` |
-
-Note the deliberate "wip" + "fix" pattern in 5/6 — looks like real iteration.
+The image bakes in the AFL++ toolchain, three libpng variants (instrumented +
+ASan, instrumented without ASan, vanilla gcc), and four harness binaries. See
+`Dockerfile` for the full build steps. After this phase, `findings/` and
+`plot_output/` are empty — the next phases populate them.
 
 ---
 

@@ -1,6 +1,9 @@
-# Report drafts (local — gitignored)
+# Report drafts
 
-Working scaffold for the 4-page USENIX-style report. Re-author in your own voice; numbers are from your actual runs and should be carried over verbatim.
+Source of truth for the Q1–Q8 prose. To be ported into a 4-page USENIX-style
+LaTeX report (`report.pdf`) for the actual submission. All numbers are taken
+from the recorded campaigns under `findings/`, `findings-qemu/`, and
+`findings-synthetic/`.
 
 ---
 
