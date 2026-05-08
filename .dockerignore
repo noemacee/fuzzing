@@ -1,0 +1,18 @@
+# Don't ship the seed generator script as a "seed" — it's not a PNG
+# and just wastes fuzzer cycles on the dry run.
+seeds/make_seeds.py
+
+# Local-only docs
+NOTES.md
+RUNBOOK.md
+
+# Findings dirs (mounted at runtime, not baked in)
+findings/
+findings-qemu/
+findings-persistent/
+findings-no-san/
+plot_output/
+plot_output_qemu/
+
+.git/
+.gitignore
