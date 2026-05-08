@@ -1,8 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <setjmp.h>
-#include <png.h>
+#include <png.h>  /* must come before any setjmp.h include — see libpng pngconf.h */
 
 /* Reject implausibly large headers up front so libpng doesn't try to
  * malloc several GB and abort before we ever exercise the parser. */

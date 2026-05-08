@@ -2,8 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <setjmp.h>
-#include <png.h>
+#include <png.h>  /* must come before any setjmp.h include — see libpng pngconf.h */
 
 #define MAX_DIM 4096
 
