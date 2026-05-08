@@ -1,6 +1,7 @@
-# Pin to amd64 — AFL++ QEMU mode and ASan are flaky under arm64 emulation
-# of an arm64 image. Going amd64 throughout keeps host/grader symmetric.
-FROM --platform=linux/amd64 aflplusplus/aflplusplus:latest
+# Use the host-native AFL++ image (multi-arch). Pinning amd64 here breaks ASan
+# under QEMU user-mode emulation on Apple Silicon (configure's link-test
+# segfaults inside the shadow-memory setup).
+FROM aflplusplus/aflplusplus:latest
 
 WORKDIR /work
 

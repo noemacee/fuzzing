@@ -3,12 +3,11 @@
 # happen inside the container.
 
 IMAGE      := cs412-fuzz
-PLATFORM   := linux/amd64
 TIME       ?= 1800              # default campaign duration: 30 min
 SEEDS_DIR  := seeds
 DICT       := png.dict
 
-DOCKER_RUN := docker run --rm --platform $(PLATFORM) \
+DOCKER_RUN := docker run --rm \
     -v $(PWD)/findings:/work/findings \
     -v $(PWD)/findings-qemu:/work/findings-qemu
 
@@ -29,7 +28,7 @@ help:
 	@echo "make distclean       also remove docker image"
 
 build:
-	docker build --platform $(PLATFORM) -t $(IMAGE) .
+	docker build -t $(IMAGE) .
 
 shell:
 	$(DOCKER_RUN) -it $(IMAGE)
