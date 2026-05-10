@@ -1,173 +1,160 @@
 # NOTES — decision log
 
-Records the key choices made in this project (target version, architecture,
-harness shape, patches) and the issues encountered and resolved during setup.
-
 ---
 
 ## Target choice
 
-**libpng 1.2.56**, downloaded from sourceforge:
-`https://download.sourceforge.net/libpng/libpng-1.2.56.tar.gz`
+**SDL 1.2.15**, the last stable release of the SDL 1.2 series.
 
-Why this version:
-- AFL++ ships `utils/libpng_no_checksum/libpng-nocrc.patch` written for the 1.2.x series — applies cleanly with `patch -p0`.
-- Has known unfixed memory-safety bugs reachable from public API (e.g., CVE-2016-10087 NULL-deref in `png_set_text_2`). Increases probability of a real crash within a 30-min run → easier Q5.
-- The lab PDF (Section 2) explicitly endorses targeting older versions: *"Using an older version with known CVEs is acceptable and even encouraged."*
-- The libpng walkthrough in the PDF uses 1.2.56 — staying on this path keeps everything we do defensible against the canonical reference.
+### Why SDL 1.2.15
 
-Counter-options considered: 1.6.37 (manual one-line patch to `png_crc_finish` in `pngrutil.c`; Q5 weaker), latest 1.6.x (likely no real crashes → forced down synthetic-bug path).
+The initial campaign targeted **libpng 1.2.56** for 2 hours. The run
+reached ~27 % edge coverage and then went 30 minutes without discovering a
+new path — genuine saturation of the surface reachable from a standard
+`png_read_info → png_read_image` harness. Zero crashes were found.
+
+SDL 1.2.15 was chosen as the replacement for the following reasons:
+
+1. **Directly reachable CVEs in the WAV decode path.**  
+   CVE-2019-7572 through CVE-2019-7578 are all in `audio/SDL_wave.c`
+   (`InitMS_ADPCM`, `MS_ADPCM_decode`, `InitIMA_ADPCM`, `IMA_ADPCM_decode`).
+   These functions are called *by `SDL_LoadWAV_RW` itself*, so the harness
+   reaches them on the very first valid ADPCM seed — no deep mutation budget
+   required. By contrast, the libpng CVEs were gated behind chunk-handler
+   paths the fuzzer never reached in 2 hours.
+
+2. **No checksum patch required.**  
+   RIFF/WAV and BMP have no CRC that would cause the parser to reject
+   mutated inputs before reaching the interesting code. The libpng-nocrc.patch
+   was necessary for libpng; nothing analogous is needed here.
+
+3. **Two independent attack surfaces.**  
+   WAV ADPCM decoding (`SDL_wave.c`) and BMP pixel-format conversion
+   (`SDL_bmp.c` / `SDL_pixels.c`) are completely separate code paths. We run
+   two campaigns with separate seed corpora and harnesses.
+
+4. **AFL++ arithmetic mutations align with the bug class.**  
+   The ADPCM CVEs are integer overflows driven by attacker-controlled
+   `nBlockAlign`, `wSamplesPerBlock`, and channel-count fields. AFL++'s
+   arithmetic mutation stage (increment/decrement bytes/words) is specifically
+   good at finding this class of bug.
+
+5. **Lab PDF endorses older versions with known CVEs.**  
+   Section 2: *"Using an older version with known CVEs is acceptable and even
+   encouraged."* SDL 1.2.15 fits this guidance precisely.
+
+### CVE inventory
+
+| CVE | Location | Bug class | Trigger |
+|---|---|---|---|
+| CVE-2019-7572 | `InitIMA_ADPCM` | heap over-read | IMA-ADPCM WAV with crafted `nBlockAlign` |
+| CVE-2019-7573 | `InitMS_ADPCM` | heap over-read | MS-ADPCM WAV with crafted block header |
+| CVE-2019-7574 | `IMA_ADPCM_decode` | heap over-read | IMA-ADPCM decode loop bounds |
+| CVE-2019-7575 | `MS_ADPCM_decode` | heap overflow | MS-ADPCM decode loop overrun |
+| CVE-2019-7576 | `InitMS_ADPCM` | heap over-read | MS-ADPCM predictor table read |
+| CVE-2019-7578 | `InitIMA_ADPCM` | heap over-read | IMA-ADPCM header read |
+| CVE-2019-7635 | `Blit1to4` | heap over-read | BMP → 32-bit surface blit |
+| CVE-2019-7636 | `SDL_GetRGB` | heap over-read | palette-indexed BMP colour lookup |
+| CVE-2019-7637 | `SDL_FillRect` | heap overflow | BMP surface initialisation |
+| CVE-2019-7638 | `Map1toN` | heap over-read | BMP pixel-format map construction |
+
+---
 
 ## Architecture
 
 Host is **Apple Silicon (arm64)**. The `aflplusplus/aflplusplus` image is
-multi-arch (amd64 + arm64), so the build runs natively on the host architecture
-rather than under emulation. The Dockerfile does **not** pin a platform — see
-Issue 1 below for why pinning was tried first and removed.
+multi-arch; the Dockerfile does not pin a platform. SDL_VIDEODRIVER=dummy and
+SDL_AUDIODRIVER=dummy are set in the container ENV so that `SDL_Init` succeeds
+in the headless Docker environment without a display or audio device.
 
-Implications for the recorded numbers:
-- Fuzzing exec speed will be lower than what's quoted in AFL++ docs (expect a
-  few hundred exec/sec instead of >1k) because of arm64 + ASan overhead.
-- Numbers in Q4/Q7/Q8 reflect arm64-native execution. On amd64 hosts the grader
-  may see different absolute speeds; the *relative* shape (persistent ≫ no-san
-  fork > ASan fork) holds across architectures.
+---
 
 ## Harness design
 
-**Decoder, full pipeline, all transforms enabled.**
+### WAV harness (`src/harness_wav.c`) — main campaign
 
 Entry-point sequence:
 ```
-png_create_read_struct → png_create_info_struct → setjmp(png_jmpbuf)
-  → png_set_read_fn (callback over fuzzer-provided buffer)
-  → png_read_info
-  → png_set_expand / png_set_strip_16 / png_set_gray_to_rgb / png_set_palette_to_rgb
-  → png_read_update_info
-  → allocate row pointers
-  → png_read_image
-  → png_read_end
-  → png_destroy_read_struct
+SDL_Init(0)
+SDL_RWFromFile(argv[1], "rb")
+SDL_LoadWAV_RW(rw, freesrc=1, &spec, &buf, &len)
+SDL_FreeWAV(buf)
+SDL_Quit()
 ```
 
-Justification for Q1:
-- **Why decoder, not encoder?** Attackers rarely control encode input; the threat model is "user opens malicious PNG."
-- **Why all transforms?** Each `png_set_*` opens a code path that the parser otherwise skips. CVE-2015-8126 lives in palette expansion (`png_set_expand`). Without these calls the relevant code is dead-coverage.
-- **Why setjmp?** libpng signals errors via `png_error → longjmp`. Without a `setjmp` site, every malformed input → unhandled longjmp → process aborts → AFL++ records a crash. False-positive flood.
-- **Why dimension/depth guards?** A mutated IHDR claiming `65535×65535` makes libpng `malloc` ~16 GB; that's a libc abort, not a parser bug. Caps avoid this false positive without hiding real issues (real images are <16k×16k).
+Key design choices:
+- **No `setjmp` needed.** SDL signals errors via return value (NULL), not
+  `longjmp`. Malformed inputs are silently rejected; only real memory bugs
+  (caught by ASan) produce a non-zero exit that AFL records as a crash.
+- **`SDL_Init(0)`** initialises SDL's internal allocator and error-string
+  tables without starting video or audio output subsystems. `SDL_LoadWAV_RW`
+  is a pure file-parsing function that does not require either subsystem.
+- **`freesrc=1`** delegates SDL_RWclose to SDL, preventing a double-free on
+  both the success and error paths.
 
-Alternatives rejected:
-- `png_image_begin_read_from_memory` (simplified API): only in 1.6+. N/A on 1.2.56.
-- Low-level chunk reader (`png_read_chunk_header` etc.): smaller surface, less interesting for security fuzzing.
-- Encoder path: less attacker-relevant.
+### BMP harness (`src/harness_bmp.c`) — secondary campaign
 
-## Patches applied
+Entry-point sequence:
+```
+SDL_Init(SDL_INIT_VIDEO)   ← SDL_VIDEODRIVER=dummy in ENV
+SDL_RWFromFile(argv[1], "rb")
+SDL_LoadBMP_RW(rw, freesrc=1)
+SDL_CreateRGBSurface(32-bit ARGB)
+SDL_BlitSurface(src, NULL, dst, NULL)
+SDL_FreeSurface × 2
+SDL_Quit()
+```
 
-`patches/libpng-nocrc.patch` — the AFL++ shipped CRC-removal patch. Without this, every byte mutated inside a chunk's data invalidates the CRC-32 → libpng calls `png_error` (critical chunks) or silently discards data (ancillary chunks). Either way the deeper parsing code never runs and coverage plateaus immediately. The lab box on page 4 of the libpng guide is explicit about this.
+The `SDL_BlitSurface` step is required to exercise the pixel-format
+conversion code (`Blit1to4`, `Map1toN`, `SDL_GetRGB`) where most BMP CVEs
+live. Loading alone does not reach those paths.
 
-We keep the CRC patch applied even in the QEMU/black-box build. Rationale: in a real closed-source scenario you couldn't patch out the checksum, but the *comparison* between instrumented and QEMU campaigns is only meaningful if both explore comparable code paths. The lab's QEMU box on page 8 of the libpng guide explicitly endorses this choice.
+### Persistent harness (`src/harness_wav_persistent.c`) — Q8
 
-## Deliverable mapping
+Uses `SDL_RWFromMem` to wrap AFL++'s shared-memory buffer directly, avoiding
+file I/O overhead in the inner loop. `__AFL_LOOP(10000)` keeps the process
+alive for 10,000 iterations before allowing a re-fork to avoid state drift.
 
-| Repo artifact | Lab section | Graded question |
+---
+
+## Seeds
+
+| File | Format | Purpose |
 |---|---|---|
-| `Dockerfile` | 3.1 | Q2 |
-| `Makefile` | 3.1, 3.2 | — |
-| `src/harness.c` | 3.1 | Q1 |
-| `src/harness_persistent.c` | 3.1 | Q8 |
-| `patches/libpng-nocrc.patch` | 3.1 | Q2 |
-| `seeds/` | — | Q3 |
-| `findings/` (gitignored, in tarball) | 3.4 | Q4, Q5 |
-| `findings-qemu/` (gitignored, in tarball) | 3.2, 3.4 | Q7 |
-| `plot_output/`, `plot_output_qemu/` | 3.4 | Q4, Q7 |
-| `report.pdf` | 3.3 | all |
+| `seeds/wav/pcm_s16le.wav` | PCM 0x0001 | Baseline RIFF parser coverage |
+| `seeds/wav/ms_adpcm.wav` | MS-ADPCM 0x0002 | Reaches CVE-2019-7573/7575/7576 immediately |
+| `seeds/wav/ima_adpcm.wav` | IMA-ADPCM 0x0011 | Reaches CVE-2019-7572/7574/7578 immediately |
+| `seeds/bmp/mono_1bpp.bmp` | 1 bpp palette | Exercises 1-bit palette path |
+| `seeds/bmp/indexed_4bpp.bmp` | 4 bpp palette | Exercises `Blit1to4` path |
+| `seeds/bmp/indexed_8bpp.bmp` | 8 bpp palette | Exercises `Map1toN` / `SDL_GetRGB` |
+| `seeds/bmp/rgb24.bmp` | 24 bpp | Exercises direct RGB copy |
+| `seeds/bmp/rgb32.bmp` | 32 bpp | Exercises 4-byte-per-pixel path |
+
+The ADPCM seeds are the most critical: they immediately place AFL in the
+ADPCM decode code paths where the CVEs live. Without them, AFL would only
+see PCM WAVs (format code 0x0001) and never reach `MS_ADPCM_decode` or
+`IMA_ADPCM_decode` via random mutation (each 2-byte format code is 1-in-65536
+by chance).
 
 ---
 
-## Issues encountered (and how they were fixed)
+## Dictionary (`sdl.dict`)
 
-### 1. ASan refuses to initialize under Docker amd64 emulation on arm64
-First Dockerfile pinned `--platform=linux/amd64`. On Apple Silicon this means amd64 binaries run via QEMU user-mode. autoconf's link-test (`./a.out`) segfaulted in ASan's shadow-memory init, so `./configure` aborted with *"cannot run C compiled programs"*.
-
-**Fix**: dropped the platform pin from both Dockerfile and Makefile. The `aflplusplus/aflplusplus` image is multi-arch (amd64 + arm64); native arch makes ASan happy. The grader's machine will pick whichever arch is native to them — also native, also works.
-
-If you need to re-pin to amd64 (e.g., grader insists on amd64-only), you can drop the ASan flag for the `--build` test by passing `--host=x86_64-linux-gnu` to configure, but that's a no-op fix because the actual fuzzing harness will then ALSO segfault under emulation. Stay native.
-
-### 2. libpng 1.2.x refuses to compile if `<setjmp.h>` is included before `<png.h>`
-First harness had:
-```c
-#include <setjmp.h>
-#include <png.h>
-```
-`pngconf.h` checks `#ifdef _SETJMP_H` and aborts with the cryptic `__pngconf.h__ ... __dont__ include it again` message. Fix: don't include `<setjmp.h>` ourselves; let `<png.h>` pull it in.
-
-### 3. `make_seeds.py` was being copied into the image as a "seed"
-First build did `COPY seeds/ /work/seeds/` which dragged the generator script along. AFL++ happily picked it up as a seed; map size for it was only 84 bits (vs 260+ for valid PNGs) → wasted exec budget on a non-PNG dry run.
-
-**Fix**: `.dockerignore` excludes `seeds/make_seeds.py`. Container ends up with only the 6 PNGs.
+Custom dictionary (AFL++ does not ship one for WAV/BMP). Contains:
+- RIFF chunk-type tags: `RIFF`, `WAVE`, `fmt `, `data`, `fact`, `LIST`, …
+- WAV format codes: `\x01\x00` (PCM), `\x02\x00` (MS-ADPCM), `\x11\x00` (IMA-ADPCM)
+- BMP magic bytes and compression codes
 
 ---
 
-## Numbers from sanity check (record in report)
+## Issues encountered
 
-### Edge counts (`AFL_DEBUG=1`)
-| Binary | Edges | Notes |
-|---|---|---|
-| `png_fuzz` (instr + ASan, fork) | **3085** | The main campaign target |
-| `png_fuzz_no_san` (instr, no ASan, fork) | **3082** | Q8 config (1) |
-| `png_fuzz_persistent` (instr + ASan, persistent) | **3099** | Q8 config (3) — slightly higher due to __AFL_LOOP macros |
-| library-only (whole-archive) | **4449** | What libpng *would* contribute if all of it were linked |
+### SDL configure fails on audio backend detection
 
-The library-only count (4449) is **higher** than the harness count (3085) because the static linker only pulls in object files our harness actually references — encoder, writers, and helpers are dropped. This is the exact "Sanity Checking Edge Counts" point from the libsixel guide. Use it for Q8.
+The AFL++ Docker image (Ubuntu) does not have ALSA/OSS/ESD headers. The
+`./configure` script auto-detects and disables unavailable backends, so no
+explicit `--disable-*` flags are strictly required for audio output. The ENV
+`SDL_AUDIODRIVER=dummy` ensures runtime fallback regardless.
 
-### 30-second smoke test of `afl-fuzz`
-- 6 seeds + 27 dictionary tokens loaded (one per chunk type + signature)
-- Dry run passed for all 6 seeds (map sizes 260–280 bits, exec ~4–5ms each)
-- After 30 sec: **93 new corpus items**, **18.41% coverage**, 0 crashes
-- Stability not yet measured — needs longer run
-
-These are arm64-native numbers. On amd64 (grader) you may see 2–3× faster exec speeds.
-
----
-
-## Command log
-
-```bash
-# environment
-git clone git@github.com:noemacee/fuzzing.git
-cd fuzzing
-
-# scaffold (in order)
-# .gitignore — exclude build outputs
-# patches/libpng-nocrc.patch — fetched from AFL++ stable branch
-# Dockerfile — multi-arch base, libpng 1.2.56, three lib builds
-# Makefile — host-driven targets
-# src/harness.c — file-input, full decode, setjmp catch
-# src/harness_persistent.c — __AFL_LOOP version for Q8
-# seeds/make_seeds.py — generator + 6 generated PNGs
-# .dockerignore — keep make_seeds.py out of the image
-
-# build
-make build                              # ~3 min on arm64 native
-
-# sanity
-make sanity                             # exit=0 expected
-docker run --rm cs412-fuzz sh -c 'for f in seeds/*.png; do ./png_fuzz "$f"; echo "$f -> $?"; done'
-                                        # all six exit 0
-echo "garbage" | docker run -i --rm cs412-fuzz sh -c 'cat > /tmp/x; ./png_fuzz /tmp/x; echo $?'
-                                        # exits 0 (libpng prints error, setjmp catches)
-
-# Edge counts
-docker run --rm -e AFL_DEBUG=1 cs412-fuzz ./png_fuzz seeds/grayscale.png 2>&1 | grep edges
-docker run --rm cs412-fuzz bash -c '
-  echo "int main(){return 0;}" > /tmp/e.c;
-  afl-clang-fast /tmp/e.c -Wl,--whole-archive /work/install/lib/libpng12.a \
-    -Wl,--no-whole-archive -lz -lm -fsanitize=address -o /tmp/L;
-  AFL_DEBUG=1 /tmp/L 2>&1 | grep edges
-'
-
-# Smoke test (30 sec)
-rm -rf findings && mkdir findings
-docker run --rm -v $PWD/findings:/work/findings cs412-fuzz \
-  afl-fuzz -i seeds -o findings -x png.dict -V 30 -- ./png_fuzz @@
-```
-
+To be explicit and reproducible, `SDL_CFG` in the Dockerfile enumerates the
+disable flags for every platform display and audio backend we know about.

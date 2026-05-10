@@ -1,212 +1,154 @@
 # RUNBOOK — re-running each phase end-to-end
 
 Step-by-step recipe for re-running the project from scratch on a clean clone.
-Assumes Docker is installed. See `README.md` for prerequisites and the
-high-level overview; this file is the operator's playbook.
+Assumes Docker is installed.
 
 ---
 
 ## Phase A — environment build
 
-Build the Docker image and verify the harness runs on a known-good seed:
-
 ```bash
-make build      # ~3–5 min depending on host arch
-make sanity     # must print "exit=0"
+make build          # ~3–5 min
+make sanity-wav     # must print "exit=0"
+make sanity-bmp     # must print "exit=0"
 ```
 
-The image bakes in the AFL++ toolchain, three libpng variants (instrumented +
-ASan, instrumented without ASan, vanilla gcc), and four harness binaries. See
-`Dockerfile` for the full build steps. After this phase, `findings/` and
-`plot_output/` are empty — the next phases populate them.
+The image builds SDL 1.2.15 three ways (instrumented+ASan / instrumented /
+vanilla gcc) and compiles five harness binaries. See `Dockerfile`.
 
 ---
 
-## Phase B — instrumented campaign (Q1–Q5, Q8)
+## Phase B — instrumented WAV campaign (main)
 
 ```bash
-# 1. Run the campaign (30 minutes minimum per PDF Section 3.4).
-make fuzz TIME=1800
-
-# 2. Watch the status screen. Take a screenshot at the end (Section 3.3
-#    requires AFL++ status screen in the appendix).
-#
-#    Note these values for the report:
-#    - stability      → Q4
-#    - corpus count   → Q4
-#    - map density    → Q4, Q8
-#    - cycles done    → Q4
-#    - havoc rows     → Q3 (count new paths from havoc)
-#    - splice rows    → Q3
-#    - dictionary row → Q3 (paths attributable to dict)
-#
-# 3. Generate the edges plot.
+make fuzz TIME=7200    # 2-hour WAV campaign
 make plot
-ls plot_output/    # edges.png, exec_speed.png, high_freq.png, low_freq.png, index.html
 ```
 
-**If crashes were found** (libpng 1.2.56 → likely `tEXt` chunk NULL-deref CVE-2016-10087):
+Screenshot the AFL++ status screen near the end. Record from `fuzzer_stats`:
+- `stability`, `corpus_count`, `edges_found`, `cycles_done`, `saved_crashes`
+- Per-strategy path counts (havoc, splice, dictionary rows on the TUI)
+
+**If crashes were found** (expected — WAV ADPCM CVEs):
 
 ```bash
-# Pick one crash to triage.
 ls findings/default/crashes/
-CRASH=findings/default/crashes/id:000000,...     # first one
+CRASH=findings/default/crashes/id:000000,...
 
-# Reproduce.
-docker run --rm -v $PWD/findings:/work/findings cs412-fuzz \
-    ./png_fuzz "$CRASH"
-# Expect ASan stack trace.
+# Reproduce
+docker run --rm -v $PWD/findings:/work/findings cs412-fuzz-sdl \
+    ./sdl_wav_fuzz "$CRASH"
 
-# Minimize.
-docker run --rm -v $PWD/findings:/work/findings cs412-fuzz \
-    afl-tmin -i "$CRASH" -o findings/min.png -- ./png_fuzz @@
+# Minimize
+docker run --rm -v $PWD/findings:/work/findings cs412-fuzz-sdl \
+    afl-tmin -i "$CRASH" -o findings/min.wav -- ./sdl_wav_fuzz @@
 
-# Diagnose with symbols.
-docker run --rm -v $PWD/findings:/work/findings cs412-fuzz \
-    bash -c 'ASAN_OPTIONS=symbolize=1 ./png_fuzz findings/min.png'
-# This output is your Q5 evidence.
+# Symbolized ASan trace
+docker run --rm -v $PWD/findings:/work/findings cs412-fuzz-sdl \
+    bash -c 'ASAN_OPTIONS=symbolize=1 ./sdl_wav_fuzz findings/min.wav' \
+    2>&1 | tee findings/asan_trace.txt
 ```
 
-**If no crashes were found** (Q5 fallback — already scaffolded):
+Map the crash to the CVE table in `NOTES.md`:
+- `MS_ADPCM_decode` → CVE-2019-7575
+- `InitMS_ADPCM` → CVE-2019-7573 / CVE-2019-7576
+- `IMA_ADPCM_decode` → CVE-2019-7574
+- `InitIMA_ADPCM` → CVE-2019-7572 / CVE-2019-7578
 
-The 1-byte heap overflow is in `patches/synthetic_bug.patch`. It targets
-`png_handle_tEXt` in `pngrutil.c` — fires the moment the fuzzer constructs
-any input containing a `tEXt` chunk. None of our 6 seeds have `tEXt`, so
-this also doubles as a demo that the dictionary works.
+**If no crashes** (unexpected given known CVEs):
 
-```bash
-# Build the layered image (fast — only relinks libpng + harness).
-make build-synthetic
-
-# Fuzz for 60 seconds. AFL splices "tEXt" from png.dict into mutated
-# inputs; ASan catches the OOB write the first time tEXt is processed.
-make fuzz-synthetic
-
-# Look for the crash.
-ls findings-synthetic/default/crashes/
-
-# Reproduce it (no fuzzer in the loop) — copy the crash file out and run
-# the harness directly with ASan symbolization on.
-CRASH=$(ls findings-synthetic/default/crashes/ | grep -v README | head -1)
-docker run --rm -v $(PWD)/findings-synthetic:/work/findings cs412-fuzz-synthetic \
-    bash -c "ASAN_OPTIONS=symbolize=1 ./png_fuzz findings/default/crashes/$CRASH"
-
-# Minimize for the report.
-docker run --rm -v $(PWD)/findings-synthetic:/work/findings cs412-fuzz-synthetic \
-    afl-tmin -i findings/default/crashes/$CRASH -o findings/min.png \
-    -- ./png_fuzz @@
-```
-
-**Q5 narrative when shipping with the synthetic bug**:
-> No real bugs were found in our 30-min instrumented run on libpng 1.2.56
-> (0 saved crashes; map density 6.80%; campaign approached but did not
-> reach saturation). To prove the setup catches bugs end-to-end, we
-> injected a 1-byte heap overflow into `png_handle_tEXt` (see
-> `patches/synthetic_bug.patch`). AFL++ used the `png.dict` dictionary
-> to splice the 4-byte `tEXt` chunk-type token into mutated inputs;
-> ASan caught the overflow within seconds of the fuzzer reaching that
-> code path. Triage: [crash file path] → afl-tmin → ASan stack trace
-> showing `heap-buffer-overflow WRITE of size 1 at offset 8` in
-> `png_handle_tEXt`. The real campaign likely needs longer wall-clock
-> time and/or a larger seed corpus including ancillary chunks to find
-> bugs of similar depth.
+Run the BMP campaign — the BMP CVEs (pixel-format conversion) are a second
+independent surface. If that also finds nothing, extend runtime to 4+ hours.
 
 ---
 
-## Phase C — black-box / QEMU campaign (Q7)
+## Phase B2 — BMP campaign (secondary)
 
 ```bash
-make fuzz-qemu TIME=1800
+make fuzz-bmp TIME=3600
+```
+
+Crash triage is identical to Phase B with `./sdl_bmp_fuzz` instead.
+
+---
+
+## Phase C — QEMU black-box campaign (Q7)
+
+```bash
+make fuzz-qemu TIME=7200
 make plot-qemu
 ```
 
-Take a screenshot of the QEMU-mode status screen for the appendix.
+Screenshot the QEMU-mode status screen. Compare with Phase B numbers:
 
-For Q7 you need to **compare** two campaigns side-by-side at the same wall-clock time:
+```bash
+grep -E "execs_done|execs_per_sec|corpus_count|edges_found|saved_crashes" \
+    findings/default/fuzzer_stats findings-qemu/default/fuzzer_stats
+```
 
-| Axis | Instrumented | QEMU mode | Why different |
-|---|---|---|---|
-| exec speed | from `findings/default/fuzzer_stats` | from `findings-qemu/default/fuzzer_stats` | QEMU translates basic blocks at runtime + per-instruction emulation overhead → 2–5× slower |
-| edges discovered | look at `afl-plot` final value | same | Compile-time instrumentation is exact; QEMU's BB-level instrumentation may miss edges across translation boundaries |
-| corpus count | status screen | status screen | Slower exec → fewer mutations attempted → fewer corpus items |
-
-`grep -E "execs_done|corpus_count|edges_found" findings/default/fuzzer_stats findings-qemu/default/fuzzer_stats` gives you the raw numbers.
+Key axes for Q7: exec speed, edges discovered, corpus count, crash detection
+sensitivity (ASan catches silent overflows; QEMU mode only catches segfaults).
 
 ---
 
-## Phase D — Q8 instrumentation depth and exec-speed comparison
+## Phase D — Q8 instrumentation depth and exec-speed
 
-Edge counts (from NOTES.md, also re-runnable):
+Edge counts at startup:
 
 ```bash
-# Library alone (whole-archive against trivial main)
-docker run --rm cs412-fuzz bash -c '
+# Library alone (whole-archive)
+docker run --rm cs412-fuzz-sdl bash -c '
   echo "int main(){return 0;}" > /tmp/e.c
   afl-clang-fast /tmp/e.c \
-    -Wl,--whole-archive /work/install/lib/libpng12.a \
-    -Wl,--no-whole-archive -lz -lm -fsanitize=address -o /tmp/L
+    -Wl,--whole-archive /work/install/lib/libSDL.a \
+    -Wl,--no-whole-archive -lm -fsanitize=address -o /tmp/L
   AFL_DEBUG=1 /tmp/L 2>&1 | grep edges
 '
 
-# Final harness binary
-docker run --rm -e AFL_DEBUG=1 cs412-fuzz ./png_fuzz seeds/grayscale.png 2>&1 | grep edges
+# WAV harness binary
+docker run --rm -e AFL_DEBUG=1 cs412-fuzz-sdl \
+    ./sdl_wav_fuzz seeds/wav/pcm_s16le.wav 2>&1 | grep edges
 ```
 
-Difference = harness contribution. The library-only count is *higher* than the harness count because static linking pulls only referenced objects (encoder + writers + helpers are dropped from the harness binary).
-
-Map density: if your status screen says e.g. `map density: 1.5%`, that's `0.015 × 65536 ≈ 983` map slots filled out of `3085` instrumented edges → ~32% of *reachable* edges actually hit. Argue why: the harness only exercises the read path with three transforms; ancillary chunk handlers (`hIST`, `sCAL`, `sBIT`, etc.) are technically reachable but rarely triggered.
-
-Exec-speed across 3 configs (each takes ~30 sec):
+Three-config exec-speed comparison:
 
 ```bash
-make fuzz-no-san     TIME=30   # config (1): no sanitizer + fork
-make fuzz            TIME=30   # config (2): ASan + fork
-make fuzz-persistent TIME=30   # config (3): ASan + persistent
+make fuzz-no-san     TIME=30    # config (1): no ASan + fork
+make fuzz            TIME=30    # config (2): ASan + fork
+make fuzz-persistent TIME=30    # config (3): ASan + persistent
 
-# Then read execs/sec out of each fuzzer_stats:
-grep execs_per_sec findings*/default/fuzzer_stats
+grep execs_per_sec \
+    findings/default/fuzzer_stats \
+    findings-no-san/default/fuzzer_stats \
+    findings-persistent/default/fuzzer_stats
 ```
 
-Expected ranking (fastest → slowest): persistent > no-san fork > asan fork. The persistent gain comes from skipping `fork()` per testcase; ASan slowdown comes from shadow-memory bookkeeping on every load/store.
+Expected order: persistent ≫ no-san fork > ASan fork.
 
 ---
 
-## Phase E — report (Q1–Q8, the actual grade)
+## Phase E — report
 
-Use the USENIX `usenix.cls` style class. 4-page body + appendix.
+4-page USENIX-style body + appendix.
 
-**Per-question evidence checklist** (every Q wants numbers from YOUR run):
+**Per-question checklist:**
 
-- **Q1 Harness Design**: paste `src/harness.c`, walk the data flow, justify each guard from a fuzzing perspective. Discuss alternatives rejected (encoder, low-level chunk reader, simplified API).
-- **Q2 Instrumentation/Sanitizers**: list every CFLAG/LDFLAG, the patch, and `--disable-shared`. Explain what removing each one would do.
-- **Q3 Seed/Dictionary**: 6 seeds + 27 tokens. Cite havoc/splice/dictionary path counts from the status screen. Dictionary entries are atomic terminals in the PNG grammar (chunk type names + signature).
-- **Q4 Campaign Analysis**: stability, corpus count, map density, cycles done. Edges curve interpretation.
-- **Q5 Crash Triage**: full reproduce → tmin → ASan symbolized stack. Cite the CVE if applicable.
-- **Q6 Attack Surface**: name two real-world apps using libpng (Chromium image pipeline, ImageMagick). Identify two code paths your harness misses (e.g., progressive read via `png_process_data`, encoder path, post-IDAT ancillary chunks past `png_read_end`).
-- **Q7 QEMU comparison**: side-by-side numbers, explain mechanism.
-- **Q8 Depth + Perf**: edge counts, map density, three-config speed comparison.
+- **Q1** Harness design: walk `src/harness_wav.c` data flow, justify no-setjmp, SDL_Init(0), freesrc=1. Mention BMP harness and why SDL_BlitSurface is needed.
+- **Q2** Instrumentation: list every CFLAG/LDFLAG, explain SDL_VIDEODRIVER=dummy, note no CRC patch needed.
+- **Q3** Seeds + dictionary: 3 WAV × 5 BMP seeds; custom `sdl.dict`. Cite havoc/splice/dictionary path counts from status screen.
+- **Q4** Campaign analysis: stability, corpus, edges, cycles. Interpret the edges-vs-time curve.
+- **Q5** Crash triage: reproduce → afl-tmin → ASan symbolized trace. Map to CVE.
+- **Q6** Attack surface: name two real SDL deployments (game engines, media players). Identify harness blind spots (streamed audio, SDL_mixer, SDL_net).
+- **Q7** QEMU comparison: side-by-side numbers, explain mechanism and ASan vs. signal-only detection difference.
+- **Q8** Depth + perf: edge counts (library vs. harness), map density, three-config speed table, explain persistent-mode 100×+ gain.
 
-**Appendix items**:
-- AFL++ status screen screenshot for both campaigns
-- `afl-plot` edges graph for both campaigns
-- `src/harness.c` full source
-- (optional) the synthetic-bug patch if you went down that path
+**Appendix:** AFL++ status screenshots, afl-plot edges graphs, harness source.
 
-**Archive contents** (Section 5):
+**Submission tarball:**
+
+```bash
+tar czf submission.tar.gz fuzzing/
+# Verify findings dirs are included (they are gitignored but must be in the tarball):
+tar tzf submission.tar.gz | grep findings/default/plot_data
+tar tzf submission.tar.gz | grep report.pdf
 ```
-fuzzing/
-  Dockerfile
-  Makefile
-  README.md
-  src/{harness.c,harness_persistent.c}
-  patches/libpng-nocrc.patch
-  seeds/*.png
-  findings/default/{plot_data, ...}
-  findings-qemu/default/{plot_data, ...}
-  plot_output/{edges.png, exec_speed.png, ...}
-  plot_output_qemu/{edges.png, ...}
-  report.tex
-  report.pdf
-```
-
-Tar it: `tar czf submission.tar.gz fuzzing/` (with findings dirs INCLUDED — they're in `.gitignore` for the repo, but Section 3.4 requires them in the archive).
