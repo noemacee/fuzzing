@@ -28,6 +28,8 @@ findings-qemu/
 findings-persistent/
 findings-no-san/
 findings-synthetic/
+findings-text/
+findings-text-seeds/
 findings_*_backup/
 plot_output/
 plot_output_qemu/
