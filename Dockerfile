@@ -1,93 +1,112 @@
-# Use the host-native AFL++ image (multi-arch). Pinning amd64 here breaks ASan
-# under QEMU user-mode emulation on Apple Silicon (configure's link-test
-# segfaults inside the shadow-memory setup).
 FROM aflplusplus/aflplusplus:latest
 
 WORKDIR /work
 
-# Most build deps come with the AFL++ image; keep this list small but explicit.
+# SDL 1.2.15 needs standard build tools only; no X11 or system audio required.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        wget patch zlib1g-dev \
+        wget \
     && rm -rf /var/lib/apt/lists/*
 
-# libpng 1.2.56 — see NOTES.md / report Q1 for rationale.
-RUN wget -q https://download.sourceforge.net/libpng/libpng-1.2.56.tar.gz \
-    && tar xzf libpng-1.2.56.tar.gz \
-    && rm libpng-1.2.56.tar.gz
+# SDL 1.2.15 — last stable 1.2.x release; contains CVE-2019-7572 … CVE-2019-7578
+# (ADPCM heap overflows in SDL_wave.c) and CVE-2019-7635 … CVE-2019-7638
+# (heap over-read/overflow in pixel-format conversion).
+RUN wget -q https://www.libsdl.org/release/SDL-1.2.15.tar.gz \
+    && tar xzf SDL-1.2.15.tar.gz \
+    && rm SDL-1.2.15.tar.gz
 
-# CRC removal patch (shipped by AFL++). Without it, every mutated chunk fails
-# CRC validation and we never reach the deeper parser.
-COPY patches/ /work/patches/
-RUN cd libpng-1.2.56 && patch -p0 < /work/patches/libpng-nocrc.patch
+# No CRC / checksum patch needed — WAV (RIFF) and BMP have no integrity check
+# that would cause the parser to reject mutated inputs early.
 
-# ---- three library builds, all installed side-by-side ----
-# 1. Instrumented + ASan: the main campaign target.
-RUN cd libpng-1.2.56 && \
-    make distclean 2>/dev/null || true; \
+# Shared configure options: disable all platform display/audio backends so the
+# build requires no system headers (X11, ALSA, OSS, …).  The null/dummy
+# backends are compiled automatically when every platform backend is disabled.
+# We only need SDL_LoadWAV_RW (audio/SDL_wave.c) and SDL_LoadBMP_RW
+# (video/SDL_bmp.c) — both are pure file-I/O functions that compile regardless
+# of which backend is chosen.
+ENV SDL_CFG="--disable-shared \
+    --without-x \
+    --disable-video-x11 --disable-video-dga --disable-video-fbcon \
+    --disable-video-directfb --disable-video-opengl --disable-video-aalib \
+    --disable-alsa --disable-oss --disable-esd --disable-arts --disable-nas \
+    --disable-joystick --disable-cdrom"
+
+# 1. Instrumented + ASan: main campaign target.
+RUN cd SDL-1.2.15 && \
     CC=afl-clang-fast CXX=afl-clang-fast++ \
     CFLAGS="-fsanitize=address -g -O1" \
     LDFLAGS="-fsanitize=address" \
-    ./configure --disable-shared --prefix=/work/install && \
+    ./configure $SDL_CFG --prefix=/work/install && \
     make -j"$(nproc)" && make install
 
-# 2. Instrumented, NO sanitizer: needed for the Q8 "no-sanitizer + fork" config.
-RUN cd libpng-1.2.56 && make distclean && \
+# 2. Instrumented, no ASan: Q8 "no-sanitizer + fork" comparison config.
+RUN cd SDL-1.2.15 && make distclean && \
     CC=afl-clang-fast CXX=afl-clang-fast++ \
     CFLAGS="-g -O1" \
-    ./configure --disable-shared --prefix=/work/install_no_san && \
+    ./configure $SDL_CFG --prefix=/work/install_no_san && \
     make -j"$(nproc)" && make install
 
-# 3. Vanilla gcc, no instrumentation, no sanitizer: the "closed-source" target
-#    fed to AFL++ in QEMU mode. Keeps the CRC patch applied on purpose
-#    (see libpng guide page 8 box "Why keep the CRC patch for QEMU mode?").
-RUN cd libpng-1.2.56 && make distclean && \
+# 3. Vanilla gcc, no instrumentation: black-box target for QEMU mode.
+RUN cd SDL-1.2.15 && make distclean && \
     CC=gcc CFLAGS="-g -O1" \
-    ./configure --disable-shared --prefix=/work/install_vanilla && \
+    ./configure $SDL_CFG --prefix=/work/install_vanilla && \
     make -j"$(nproc)" && make install
 
 # ---- harness binaries ----
 COPY src/ /work/src/
 
-# Main campaign harness: instrumented + ASan, fork-server mode.
-RUN afl-clang-fast /work/src/harness.c \
-        -I/work/install/include -L/work/install/lib \
+# Main campaign: WAV/ADPCM harness, instrumented + ASan, fork-server mode.
+# Targets CVE-2019-7572 … CVE-2019-7578 in SDL_wave.c ADPCM decoders.
+RUN afl-clang-fast /work/src/harness_wav.c \
+        -I/work/install/include/SDL -L/work/install/lib \
         -fsanitize=address -g -O1 \
-        -lpng12 -lz -lm \
-        -o /work/png_fuzz
+        -lSDL -lm \
+        -o /work/sdl_wav_fuzz
 
-# Q8 config (1): instrumented, no sanitizer, fork-server mode.
-RUN afl-clang-fast /work/src/harness.c \
-        -I/work/install_no_san/include -L/work/install_no_san/lib \
-        -g -O1 \
-        -lpng12 -lz -lm \
-        -o /work/png_fuzz_no_san
+# BMP harness, instrumented + ASan, fork-server mode.
+# Targets CVE-2019-7635 … CVE-2019-7638 in SDL pixel-format conversion.
+RUN afl-clang-fast /work/src/harness_bmp.c \
+        -I/work/install/include/SDL -L/work/install/lib \
+        -fsanitize=address -g -O1 \
+        -lSDL -lm \
+        -o /work/sdl_bmp_fuzz
+
+# Q8 config (1): instrumented, no ASan, fork mode.
+RUN afl-clang-fast /work/src/harness_wav.c \
+        -I/work/install_no_san/include/SDL -L/work/install_no_san/lib \
+        -g -O1 -lSDL -lm \
+        -o /work/sdl_wav_fuzz_no_san
 
 # Q8 config (3): instrumented + ASan, persistent loop.
-RUN afl-clang-fast /work/src/harness_persistent.c \
-        -I/work/install/include -L/work/install/lib \
+RUN afl-clang-fast /work/src/harness_wav_persistent.c \
+        -I/work/install/include/SDL -L/work/install/lib \
         -fsanitize=address -g -O1 \
-        -lpng12 -lz -lm \
-        -o /work/png_fuzz_persistent
+        -lSDL -lm \
+        -o /work/sdl_wav_fuzz_persistent
 
-# QEMU-mode target: vanilla gcc, no instrumentation, no sanitizer.
-RUN gcc /work/src/harness.c \
-        -I/work/install_vanilla/include -L/work/install_vanilla/lib \
-        -g -O1 \
-        -lpng12 -lz -lm \
-        -o /work/png_fuzz_qemu
+# QEMU-mode targets: vanilla gcc, no instrumentation.
+RUN gcc /work/src/harness_wav.c \
+        -I/work/install_vanilla/include/SDL -L/work/install_vanilla/lib \
+        -g -O1 -lSDL -lm \
+        -o /work/sdl_wav_fuzz_qemu
 
-# Seeds + dictionary.
+RUN gcc /work/src/harness_bmp.c \
+        -I/work/install_vanilla/include/SDL -L/work/install_vanilla/lib \
+        -g -O1 -lSDL -lm \
+        -o /work/sdl_bmp_fuzz_qemu
+
+# Seeds (WAV and BMP) + custom dictionary.
 COPY seeds/ /work/seeds/
-RUN cp /AFLplusplus/dictionaries/png.dict /work/png.dict
+COPY sdl.dict /work/sdl.dict
 
-# Findings dirs are bind-mounted at runtime, but pre-create them so afl-fuzz
-# doesn't fail if someone runs the image without mounts.
 RUN mkdir -p /work/findings /work/findings-qemu
 
-# Knobs that smooth over Mac/Docker quirks (no host /proc/sys access etc.).
+# SDL_VIDEODRIVER=dummy prevents SDL_Init from trying to open a real display
+# in the headless container (needed for SDL_LoadBMP_RW surface operations).
 ENV AFL_SKIP_CPUFREQ=1 \
     AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
     AFL_NO_AFFINITY=1 \
-    AFL_AUTORESUME=1
+    AFL_AUTORESUME=1 \
+    SDL_VIDEODRIVER=dummy \
+    SDL_AUDIODRIVER=dummy
 
 CMD ["/bin/bash"]

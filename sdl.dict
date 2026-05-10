@@ -1,0 +1,56 @@
+# SDL 1.2.15 fuzzing dictionary — WAV (RIFF) and BMP tokens.
+#
+# RIFF/WAV chunk identifiers: AFL++ splices these 4-byte tags into mutated
+# inputs so the parser can reach chunk handlers that random bit-flips would
+# statistically never construct (each 4-byte tag is 1-in-2^32 by chance).
+#
+# WAV format codes: the 2-byte wFormatTag field gates which decoder runs.
+# 0x0001=PCM  0x0002=MS-ADPCM (CVE-2019-7575)  0x0011=IMA-ADPCM (CVE-2019-7572..7578)
+# Providing these lets AFL++ immediately explore all three decode paths.
+#
+# BMP magic / field tokens: the 2-byte signature and common compression codes.
+
+# --- RIFF/WAV chunk tags ---
+"RIFF"
+"WAVE"
+"fmt "
+"data"
+"fact"
+"LIST"
+"INFO"
+"cue "
+"plst"
+"smpl"
+"inst"
+"JUNK"
+"bext"
+"ID3 "
+
+# --- WAV format codes (wFormatTag, little-endian 2 bytes) ---
+"\x01\x00"    # PCM
+"\x02\x00"    # MS-ADPCM      ← CVE-2019-7573 / CVE-2019-7575 / CVE-2019-7576
+"\x11\x00"    # IMA-ADPCM     ← CVE-2019-7572 / CVE-2019-7574 / CVE-2019-7578
+"\x06\x00"    # a-law
+"\x07\x00"    # mu-law
+"\xFE\xFF"    # WAVE_FORMAT_EXTENSIBLE
+
+# --- BMP magic and DIB header sizes ---
+"BM"
+"BA"
+"CI"
+"CP"
+"IC"
+"PT"
+
+# --- BMP bit-depth field values (bpp, 2 bytes little-endian) ---
+"\x01\x00"    # 1 bpp
+"\x04\x00"    # 4 bpp
+"\x08\x00"    # 8 bpp
+"\x18\x00"    # 24 bpp
+"\x20\x00"    # 32 bpp
+
+# --- BMP compression codes (4 bytes little-endian) ---
+"\x00\x00\x00\x00"    # BI_RGB
+"\x01\x00\x00\x00"    # BI_RLE8
+"\x02\x00\x00\x00"    # BI_RLE4
+"\x03\x00\x00\x00"    # BI_BITFIELDS

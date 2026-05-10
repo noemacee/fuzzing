@@ -18,23 +18,27 @@
 .deps/
 .libs/
 
-# libpng source tree (we download it in the Dockerfile)
-libpng-*/
-libpng-*.tar.gz
+# SDL source tree (downloaded in the Dockerfile)
+SDL-*/
+SDL-*.tar.gz
 
-# AFL++ outputs (huge, regenerated each run)
+# AFL++ outputs (huge, regenerated each run — include in submission tarball)
 findings/
+findings-bmp/
 findings-qemu/
+findings-qemu-bmp/
 findings-persistent/
 findings-no-san/
-findings-synthetic/
 plot_output/
 plot_output_qemu/
 
 # Harness binaries
-png_fuzz
-png_fuzz_qemu
-png_fuzz_persistent
+sdl_wav_fuzz
+sdl_bmp_fuzz
+sdl_wav_fuzz_no_san
+sdl_wav_fuzz_persistent
+sdl_wav_fuzz_qemu
+sdl_bmp_fuzz_qemu
 
 # Local install prefixes
 install/
