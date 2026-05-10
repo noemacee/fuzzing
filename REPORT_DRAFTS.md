@@ -12,21 +12,21 @@ from the recorded campaigns under `findings/`, `findings-qemu/`, and
 ### Instrumented campaign (white-box)
 | Field | Value |
 |---|---|
-| run_time | 30 min 30 s |
-| execs_done | 448,119 |
-| execs_per_sec | 248.17 (last min) |
-| corpus_count | 515 |
-| corpus_favored | 117 |
-| edges_found | 827 / 3090 (26.76 %) |
-| bitmap_cvg | 26.76 % |
-| map density (current / total) | 6.80 % / 26.76 % |
+| run_time | 2 h 3 min 40 s (7420 s) |
+| execs_done | 1,267,996 |
+| execs_per_sec | 170.87 |
+| corpus_count | 674 |
+| corpus_favored | 146 (21.66 %) |
+| edges_found | 912 / 3090 (29.51 %) |
+| bitmap_cvg | 29.51 % |
+| map density (current / total) | 6.50 % / 29.51 % |
 | stability | 100.00 % |
-| cycles_done | 1 |
-| pending_total | 197 |
+| cycles_done | 10 |
+| pending_total | 11 |
 | saved_crashes | 0 |
 | saved_hangs | 0 |
-| total_tmout | 3 (0 saved) |
-| last_find | t = 1795 s (5 s before stop) |
+| total_tmout | 42 (0 saved) |
+| last_find | t = 5149 s (85.8 min; 38 min before stop) |
 
 ### QEMU campaign (black-box)
 | Field | Value |
@@ -72,33 +72,34 @@ from the recorded campaigns under `findings/`, `findings-qemu/`, and
 >
 > **Dictionary.** We use the AFL++-shipped `dictionaries/png.dict` (27 entries: the 8-byte PNG signature plus chunk-type strings `IHDR`, `PLTE`, `IDAT`, `IEND`, `gAMA`, `cHRM`, `tEXt`, `zTXt`, `iTXt`, etc.). In formal terms, the dictionary entries are the atomic terminals of the PNG grammar — the parser dispatches on these 4-byte chunk-type tokens, and discovering them by random bit flips would take ~2³² attempts per byte position. The dictionary lets AFL++ splice them in directly.
 >
-> **Yields after 30 min** (from the AFL++ status screen):
+> **Yields after 2 h 3 min** (from the AFL++ status screen, `appendix/status_main.png`):
 >
 > | Strategy | Yield / Execs | Hit rate |
 > |---|---|---|
-> | havoc/splice | 305 / 358k | 0.085 % |
-> | bit/byte flips (combined) | 16 / 38k | 0.042 % |
-> | arithmetic (combined) | 12 / 490k | 0.0024 % |
-> | known ints (combined) | 4 / 144k | 0.0028 % |
-> | dictionary | 3 / 38.3k | 0.0078 % |
+> | havoc/splice | **505 / 1.07M** | 0.047 % |
+> | bit flips (combined) | 20 / 10.8k | 0.185 % |
+> | byte flips (combined) | 1 / 1.3k | 0.077 % |
+> | arithmetics (combined) | 3 / 151k | 0.002 % |
+> | known ints (combined) | 4 / 44.8k | 0.009 % |
+> | dictionary | 1 / 24.4k | 0.004 % |
 >
-> Havoc dominates absolute path discovery (305 of ~340 new paths from these stages); the dictionary's three contributions are individually high-leverage because each opens a chunk-handler subtree that havoc subsequently explores. The synthetic-bug experiment in Q5 confirms this: AFL++ used a `tEXt` token from the dictionary to construct a 16-byte crash input, which pure bit-flipping could not have produced in any tractable time.
+> Havoc dominates absolute path discovery (505 of ~534 total new paths — 94.6 %); the dictionary's single direct contribution is individually high-leverage because it opens a chunk-handler subtree that havoc subsequently explores in depth. The synthetic-bug experiment in Q5 confirms this: AFL++ used a `tEXt` token from the dictionary to construct a 16-byte crash input within 17 seconds, which pure bit-flipping could not have produced in any tractable time (1 in 2³² per byte position).
 
 ---
 
 ## Q4 — Campaign analysis (5 pts)
 
-> **Campaign analysis.** Final stability 100.00 % confirms harness determinism — same input produces the same coverage on every execution, a precondition for AFL++'s feedback to be meaningful. The corpus grew from 6 seeds to 515 items in 30 min 30 s; 117 of those (22.7 %) are favored. AFL++ reports 827 unique edges hit out of 3090 instrumented (`edges_found / total_edges` from `fuzzer_stats`), giving 26.76 % bitmap coverage. Current map density at termination is 6.80 %.
+> **Campaign analysis.** Final stability 100.00 % confirms harness determinism — same input produces the same coverage on every execution, a precondition for AFL++'s feedback to be meaningful. The corpus grew from 6 seeds to 674 items in 2 h 3 min 40 s; 146 of those (21.66 %) are favored. AFL++ reports 912 unique edges hit out of 3090 instrumented (`edges_found / total_edges` from `fuzzer_stats`), giving 29.51 % bitmap coverage. Current map density at termination is 6.50 %.
 >
-> The edges-vs-time curve (Figure A.1) shows three phases: a steep ramp through the first 600 seconds (~565 → 720 edges) as the fuzzer discovers the basic read pipeline; a slower climb from 600 – 1100 s (720 → 815 edges) driven by dictionary-assisted chunk-type discovery; and a near-plateau after 1100 s, with fewer than 10 new edges in the final 10 minutes. The campaign therefore approached saturation but was not flat — `last_find` is logged at t = 1795 s, only 5 s before the time-limit cutoff. A longer run would yield marginal additional coverage.
+> The edges-vs-time curve (Figure A.1) shows four phases. A steep ramp in the first 600 s (599 → 819 edges) as the fuzzer discovers the basic decode pipeline from the six seeds. A moderate climb from 600 – 2000 s (819 → 858 edges) as dictionary-assisted chunk-type mutations open new subtrees. A second burst from 2800 – 3500 s (858 → 899 edges) driven by havoc recombining the accumulated corpus. A final trickle from 3500 – 5149 s (899 → 912 edges), then an absolute plateau: zero new edges from t = 5149 s through the 7420 s cutoff — 38 uninterrupted minutes of silence. With 10 cycles completed and only 11 corpus items still pending, the campaign reached saturation.
 >
-> ~26.8 % edge coverage is consistent with the harness's deliberate scope: the read path with three transforms (palette/strip-16/gray-to-RGB), reading info chunks, processing IDAT, then `png_read_end`. Encoder code, untriggered ancillary chunks (`sBIT`, `sCAL`, `hIST`), and the progressive-read API (`png_process_data`) remain unreached by design — they are interesting in principle but require either additional harnesses or longer wall-clock time to access via dictionary-driven mutation.
+> 29.5 % edge coverage is consistent with the harness's deliberate scope: the read path with three transforms (palette/strip-16/gray-to-RGB), reading info chunks, processing IDAT, then `png_read_end`. Encoder code, untriggered ancillary chunks (`sBIT`, `sCAL`, `hIST`), and the progressive-read API (`png_process_data`) remain unreached by design — they require either additional harnesses or seeds that already contain those chunk types to be reached via mutation.
 
 ---
 
 ## Q5 — Crash triage (5 pts)
 
-> **Crash triage.** The 30-min instrumented campaign on the unmodified libpng-1.2.56 yielded zero crashes. To prove the toolchain catches bugs end-to-end, we injected a controlled 1-byte heap overflow into `png_handle_tEXt` (`patches/synthetic_bug.patch`):
+> **Crash triage.** The 2-hour instrumented campaign on the unmodified libpng-1.2.56 yielded zero crashes. To prove the toolchain catches bugs end-to-end, we injected a controlled 1-byte heap overflow into `png_handle_tEXt` (`patches/synthetic_bug.patch`):
 >
 > ```c
 > png_byte *_synth = (png_byte *)png_malloc(png_ptr, 8);
