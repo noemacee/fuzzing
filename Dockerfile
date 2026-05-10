@@ -30,25 +30,30 @@ ENV SDL_CFG="--disable-shared \
     --disable-alsa --disable-oss --disable-esd --disable-arts --disable-nas \
     --disable-joystick --disable-cdrom"
 
+# SDL 1.2.15 ships a very old config.guess that does not recognise the
+# aarch64-linux kernel triple used inside Docker on Apple Silicon.
+# --build=$(gcc -dumpmachine) bypasses config.guess entirely and tells
+# autoconf the exact host triple directly.
+
 # 1. Instrumented + ASan: main campaign target.
 RUN cd SDL-1.2.15 && \
     CC=afl-clang-fast CXX=afl-clang-fast++ \
     CFLAGS="-fsanitize=address -g -O1" \
     LDFLAGS="-fsanitize=address" \
-    ./configure $SDL_CFG --prefix=/work/install && \
+    ./configure --build=$(gcc -dumpmachine) $SDL_CFG --prefix=/work/install && \
     make -j"$(nproc)" && make install
 
 # 2. Instrumented, no ASan: Q8 "no-sanitizer + fork" comparison config.
 RUN cd SDL-1.2.15 && make distclean && \
     CC=afl-clang-fast CXX=afl-clang-fast++ \
     CFLAGS="-g -O1" \
-    ./configure $SDL_CFG --prefix=/work/install_no_san && \
+    ./configure --build=$(gcc -dumpmachine) $SDL_CFG --prefix=/work/install_no_san && \
     make -j"$(nproc)" && make install
 
 # 3. Vanilla gcc, no instrumentation: black-box target for QEMU mode.
 RUN cd SDL-1.2.15 && make distclean && \
     CC=gcc CFLAGS="-g -O1" \
-    ./configure $SDL_CFG --prefix=/work/install_vanilla && \
+    ./configure --build=$(gcc -dumpmachine) $SDL_CFG --prefix=/work/install_vanilla && \
     make -j"$(nproc)" && make install
 
 # ---- harness binaries ----
