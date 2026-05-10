@@ -1,14 +1,17 @@
-# Don't ship the seed generator script as a "seed" — it's not a PNG
-# and just wastes fuzzer cycles on the dry run.
+# Don't ship the seed generator script — it's not a WAV/BMP and would
+# be picked up by AFL++ as a seed, wasting calibration cycles.
 seeds/make_seeds.py
 
 # Local-only docs
 NOTES.md
 RUNBOOK.md
+REPORT_DRAFTS.md
 
-# Findings dirs (mounted at runtime, not baked in)
+# Findings dirs (bind-mounted at runtime, not baked in)
 findings/
+findings-bmp/
 findings-qemu/
+findings-qemu-bmp/
 findings-persistent/
 findings-no-san/
 plot_output/
