@@ -55,6 +55,14 @@ RUN afl-clang-fast /work/src/harness.c \
         -lpng12 -lz -lm \
         -o /work/png_fuzz
 
+# CVE-2016-10087 targeted harness: hardcodes the png_free_data+png_set_text
+# sequence so AFL only needs to find inputs that contain a tEXt chunk.
+RUN afl-clang-fast /work/src/harness_text.c \
+        -I/work/install/include -L/work/install/lib \
+        -fsanitize=address -g -O1 \
+        -lpng12 -lz -lm \
+        -o /work/png_fuzz_text
+
 # Q8 config (1): instrumented, no sanitizer, fork-server mode.
 RUN afl-clang-fast /work/src/harness.c \
         -I/work/install_no_san/include -L/work/install_no_san/lib \

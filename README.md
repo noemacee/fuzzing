@@ -245,6 +245,59 @@ See `RUNBOOK.md` for the detailed phase-by-phase commands.
 
 ---
 
+## Crash reproduction — CVE-2016-10087
+
+We confirmed that libpng 1.2.56 is vulnerable to CVE-2016-10087 (NULL-pointer
+dereference in `png_set_text_2`) and reproduced the crash against our harness.
+
+**What the bug is.** `png_free_data(PNG_FREE_TEXT, -1)` sets `info->text = NULL`
+and `info->num_text = 0` but leaves `info->max_text` at its previous non-zero
+value (e.g. 9). A subsequent call to `png_set_text` checks `num_text + 1 > max_text`
+(i.e. `1 > 9`), skips the reallocation branch, and writes through the NULL
+`text` pointer — crashing with SIGSEGV.
+
+**How we reproduced it.**
+
+```bash
+# 1. Generate the PoC PNG (tEXt chunk primes max_text to 9)
+python3 poc_cve_2016_10087.py
+
+# 2. Build and run the targeted reproducer harness
+make reproduce-cve-2016
+
+# 3. Run AFL against the CVE-specific harness (finds crash in ~30 s)
+make fuzz-text TIME=120
+
+# 4. Minimise the crash input
+docker run --rm \
+  -v $(PWD)/findings-text:/work/findings-text \
+  cs412-fuzz \
+  afl-tmin -i findings-text/default/crashes/id:000000* \
+           -o /work/findings-text/min_crash.png \
+           -- ./png_fuzz_text @@
+
+# 5. Confirm the minimised input reproduces the crash
+docker run --rm \
+  -v $(PWD)/findings-text:/work/findings-text \
+  cs412-fuzz \
+  /work/png_fuzz_text /work/findings-text/min_crash.png
+```
+
+**ASan output (abbreviated):**
+```
+ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000
+The signal is caused by a WRITE memory access.
+    #0  png_set_text_2  /work/libpng-1.2.56/pngset.c
+    #1  png_set_text    /work/libpng-1.2.56/pngset.c:654
+    #2  main            /work/src/harness_text.c:74
+```
+
+AFL found the crash in 27 seconds (2 652 executions) via a dictionary overwrite
+at byte offset 37 — the `tRNS` chunk-type field — replacing it with `tEXt`.
+`afl-tmin` reduced the crashing input from 56 bytes to 55 bytes.
+
+---
+
 ## Background reading
 
 - AFL++ documentation: <https://aflplus.plus/docs/>
