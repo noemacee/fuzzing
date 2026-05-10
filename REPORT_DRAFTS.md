@@ -1,276 +1,235 @@
-# Report drafts
+# Report drafts — SDL 1.2.15 fuzzing lab
 
-Source of truth for the Q1–Q8 prose. To be ported into a 4-page USENIX-style
-LaTeX report (`report.pdf`) for the actual submission. All numbers are taken
-from the recorded campaigns under `findings/`, `findings-qemu/`, and
-`findings-synthetic/`.
+Draft prose for Q1–Q8. Numbers in [brackets] are placeholders to fill in
+from actual campaign runs. Port to USENIX LaTeX for the final submission.
 
 ---
 
-## Headline numbers (cite throughout)
+## Q1 — Harness design
 
-### Instrumented campaign (white-box)
-| Field | Value |
-|---|---|
-| run_time | 30 min 30 s |
-| execs_done | 448,119 |
-| execs_per_sec | 248.17 (last min) |
-| corpus_count | 515 |
-| corpus_favored | 117 |
-| edges_found | 827 / 3090 (26.76 %) |
-| bitmap_cvg | 26.76 % |
-| map density (current / total) | 6.80 % / 26.76 % |
-| stability | 100.00 % |
-| cycles_done | 1 |
-| pending_total | 197 |
-| saved_crashes | 0 |
-| saved_hangs | 0 |
-| total_tmout | 3 (0 saved) |
-| last_find | t = 1795 s (5 s before stop) |
-
-### QEMU campaign (black-box)
-| Field | Value |
-|---|---|
-| run_time | 30 min 0 s |
-| execs_done | 592,842 |
-| execs_per_sec | 313.40 (last min) |
-| corpus_count | 597 |
-| corpus_favored | 143 |
-| edges_found | 2245 / 65536 |
-| bitmap_cvg | 3.43 % |
-| map density (current / total) | 0.76 % / 3.43 % |
-| stability | 100.00 % |
-| cycles_done | 3 |
-| pending_total | 104 |
-| saved_crashes | 0 |
-| total_tmout | 1 |
-| last_find | t = 1799 s |
-
-### Synthetic-bug demo (Q5)
-| Field | Value |
-|---|---|
-| run_time | 60 s |
-| total crashes / saved | 3 / 2 |
-| time-to-first-crash | 17 s |
-| execs to first crash | 7,616 |
-| corpus_count | 125 |
-| stability | 100.00 % |
-
-### Edge counts (`AFL_DEBUG=1`, for Q8)
-| Binary | Edges | Built with |
-|---|---|---|
-| `png_fuzz` | 3085 | afl-clang-fast + ASan + fork |
-| `png_fuzz_no_san` | 3082 | afl-clang-fast + fork (no ASan) |
-| `png_fuzz_persistent` | 3099 | afl-clang-fast + ASan + persistent |
-| library-only (whole-archive) | 4449 | afl-clang-fast over libpng12.a |
+> **WAV harness (`src/harness_wav.c`).** The harness drives SDL's WAV decode
+> pipeline against a single input file passed by AFL++ via the `@@`
+> placeholder. The entry-point sequence is: `SDL_Init(0)` →
+> `SDL_RWFromFile(argv[1], "rb")` → `SDL_LoadWAV_RW(rw, 1, &spec, &buf,
+> &len)` → `SDL_FreeWAV(buf)` → `SDL_Quit()`.
+>
+> We chose this surface for three reasons.
+>
+> First, **WAV parsing over encoding.** The realistic threat model is an
+> attacker who supplies a crafted audio file to a player or SDK that calls
+> `SDL_LoadWAV`. Encoding (SDL has no WAV encoder) is not a relevant attack
+> vector.
+>
+> Second, **`SDL_LoadWAV_RW` covers all three codec paths in one call.**
+> Depending on the `wFormatTag` field in the `fmt ` chunk, SDL dispatches to
+> `InitMS_ADPCM` + `MS_ADPCM_decode` (format 0x0002) or `InitIMA_ADPCM` +
+> `IMA_ADPCM_decode` (format 0x0011) or the simple PCM copy. All three paths
+> are reachable from our single harness entry point, gated only by a 2-byte
+> format code that the dictionary provides immediately.
+>
+> Third, **no `setjmp` needed.** SDL signals errors via return value (NULL),
+> not `longjmp`. Malformed inputs that SDL cannot parse are silently rejected
+> with a NULL return; only genuine memory-safety bugs — caught by
+> AddressSanitizer — cause a non-zero process exit that AFL++ records as a
+> crash. This avoids the false-positive flood that the libpng harness had to
+> defend against with `setjmp`.
+>
+> **Design choices justified:**
+>
+> | Choice | Justification |
+> |---|---|
+> | `SDL_Init(0)` — no subsystems | `SDL_LoadWAV_RW` is a pure file-parsing function; no audio output device is needed. Requesting no subsystems avoids the `SDL_AUDIODRIVER=dummy` fallback path being exercised at init rather than during parsing. |
+> | `freesrc=1` | SDL calls `SDL_RWclose` on the `SDL_RWops` after parsing (success or error), so we do not need to close it separately. Without `freesrc=1` we would need error-path cleanup code that mirrors what SDL already does. |
+> | No dimension / size guard | SDL's ADPCM decoders do their own size validation; any OOM from a crafted large `nBlockAlign` is an SDL bug, not a fuzzing false positive. We do not guard against it. |
+>
+> **BMP harness (`src/harness_bmp.c`).** Secondary campaign. Entry-point:
+> `SDL_Init(SDL_INIT_VIDEO)` (using `SDL_VIDEODRIVER=dummy`) →
+> `SDL_LoadBMP_RW(rw, 1)` → `SDL_CreateRGBSurface(32-bit ARGB)` →
+> `SDL_BlitSurface(src, NULL, dst, NULL)`. The `SDL_BlitSurface` step is
+> required to exercise the pixel-format conversion code (`Blit1to4`,
+> `Map1toN`, `SDL_GetRGB`) where CVE-2019-7635 … CVE-2019-7638 live.
+> Loading alone does not reach those paths.
 
 ---
 
-## Q3 — Seed corpus and dictionary (5 pts)
+## Q2 — Instrumentation and sanitizers
 
-> **Seeds.** The corpus was bootstrapped from six hand-generated PNGs covering the four canonical color types (grayscale, RGB, palette, RGBA) at 1-, 8-, and 16-bit depths. Each seed is under 200 bytes, keeping calibration time negligible. They were generated by `seeds/make_seeds.py` for full reproducibility.
+> **Build flags and their purpose:**
 >
-> **Dictionary.** We use the AFL++-shipped `dictionaries/png.dict` (27 entries: the 8-byte PNG signature plus chunk-type strings `IHDR`, `PLTE`, `IDAT`, `IEND`, `gAMA`, `cHRM`, `tEXt`, `zTXt`, `iTXt`, etc.). In formal terms, the dictionary entries are the atomic terminals of the PNG grammar — the parser dispatches on these 4-byte chunk-type tokens, and discovering them by random bit flips would take ~2³² attempts per byte position. The dictionary lets AFL++ splice them in directly.
->
-> **Yields after 30 min** (from the AFL++ status screen):
->
-> | Strategy | Yield / Execs | Hit rate |
+> | Flag / setting | What it does | Effect of omitting |
 > |---|---|---|
-> | havoc/splice | 305 / 358k | 0.085 % |
-> | bit/byte flips (combined) | 16 / 38k | 0.042 % |
-> | arithmetic (combined) | 12 / 490k | 0.0024 % |
-> | known ints (combined) | 4 / 144k | 0.0028 % |
-> | dictionary | 3 / 38.3k | 0.0078 % |
->
-> Havoc dominates absolute path discovery (305 of ~340 new paths from these stages); the dictionary's three contributions are individually high-leverage because each opens a chunk-handler subtree that havoc subsequently explores. The synthetic-bug experiment in Q5 confirms this: AFL++ used a `tEXt` token from the dictionary to construct a 16-byte crash input, which pure bit-flipping could not have produced in any tractable time.
+> | `CC=afl-clang-fast` | Injects a PC-guard probe at every basic-block entry. Probes feed AFL++'s coverage bitmap. | Without compile-time instrumentation, AFL++ degenerates to blind random fuzzing — equivalent to QEMU mode but without QEMU's systematic BB-level tracking. |
+> | `-fsanitize=address` | Shadow-memory checks on every load/store; heap/stack redzones; malloc/free hooks. | The ADPCM CVEs overflow heap allocations by a small number of bytes. Without ASan, these do not segfault — the overflow silently corrupts adjacent heap metadata. AFL++ would see no crash. |
+> | `-g` | DWARF debug symbols. | ASan's `llvm-symbolizer` cannot map crash addresses to `file:line`. Stack traces become hex-only addresses; triage is much harder. |
+> | `-O1` | Modest optimization. | `-O0` adds ~2–3× execution overhead (every variable lives in memory). `-O2`/`-O3` can merge distinct CFG edges, reducing coverage signal. `-O1` is the AFL++-recommended compromise. |
+> | `--disable-shared` | Static-only SDL build. | Shared library requires runtime `LD_LIBRARY_PATH` setup inside the container, complicates the fork-server, and prevents the linker from dropping unreferenced object files. |
+> | `SDL_VIDEODRIVER=dummy` | Headless video driver. | `SDL_Init(SDL_INIT_VIDEO)` (used by the BMP harness for `SDL_CreateRGBSurface`) would fail in the container without a display. |
+> | No CRC / checksum patch | Not applicable — WAV and BMP have no integrity field that would cause the parser to reject mutated inputs before reaching the interesting code. | (N/A — this is an advantage over libpng.) |
 
 ---
 
-## Q4 — Campaign analysis (5 pts)
+## Q3 — Seed corpus and dictionary
 
-> **Campaign analysis.** Final stability 100.00 % confirms harness determinism — same input produces the same coverage on every execution, a precondition for AFL++'s feedback to be meaningful. The corpus grew from 6 seeds to 515 items in 30 min 30 s; 117 of those (22.7 %) are favored. AFL++ reports 827 unique edges hit out of 3090 instrumented (`edges_found / total_edges` from `fuzzer_stats`), giving 26.76 % bitmap coverage. Current map density at termination is 6.80 %.
+> **Seeds.** The WAV corpus is bootstrapped from three hand-crafted files:
+> `pcm_s16le.wav` (format 0x0001, PCM), `ms_adpcm.wav` (format 0x0002,
+> MS-ADPCM), and `ima_adpcm.wav` (format 0x0011, IMA-ADPCM). The ADPCM seeds
+> are critical: they immediately place AFL++ inside the `InitMS_ADPCM` /
+> `MS_ADPCM_decode` and `InitIMA_ADPCM` / `IMA_ADPCM_decode` functions on the
+> very first execution. Without them, AFL++ would only see PCM code until it
+> randomly mutated the 2-byte `wFormatTag` field to 0x0002 or 0x0011 — a
+> 1-in-65,536 event per mutation attempt. Five BMP seeds cover the four
+> canonical SDL bit-depth paths (1/4/8/24/32 bpp), each routing through a
+> different pixel-format conversion function.
 >
-> The edges-vs-time curve (Figure A.1) shows three phases: a steep ramp through the first 600 seconds (~565 → 720 edges) as the fuzzer discovers the basic read pipeline; a slower climb from 600 – 1100 s (720 → 815 edges) driven by dictionary-assisted chunk-type discovery; and a near-plateau after 1100 s, with fewer than 10 new edges in the final 10 minutes. The campaign therefore approached saturation but was not flat — `last_find` is logged at t = 1795 s, only 5 s before the time-limit cutoff. A longer run would yield marginal additional coverage.
+> **Dictionary.** `sdl.dict` is a custom dictionary (AFL++ ships none for
+> WAV/BMP). It contains RIFF chunk-type tags (`RIFF`, `WAVE`, `fmt `, `data`,
+> `fact`, `LIST`, …), WAV format codes (`\x01\x00`, `\x02\x00`, `\x11\x00`),
+> BMP magic bytes (`BM`, `BA`, …), and BMP compression codes. The chunk tags
+> are 4-byte tokens that AFL++ can splice into mutated inputs to construct
+> parseable RIFF structures from random bytes; the format codes gate which
+> decoder runs and are 2-byte tokens that random bit-flips would statistically
+> never construct.
 >
-> ~26.8 % edge coverage is consistent with the harness's deliberate scope: the read path with three transforms (palette/strip-16/gray-to-RGB), reading info chunks, processing IDAT, then `png_read_end`. Encoder code, untriggered ancillary chunks (`sBIT`, `sCAL`, `hIST`), and the progressive-read API (`png_process_data`) remain unreached by design — they are interesting in principle but require either additional harnesses or longer wall-clock time to access via dictionary-driven mutation.
-
----
-
-## Q5 — Crash triage (5 pts)
-
-> **Crash triage.** The 30-min instrumented campaign on the unmodified libpng-1.2.56 yielded zero crashes. To prove the toolchain catches bugs end-to-end, we injected a controlled 1-byte heap overflow into `png_handle_tEXt` (`patches/synthetic_bug.patch`):
+> **Strategy yields after [X] min** (from AFL++ status screen):
 >
-> ```c
-> png_byte *_synth = (png_byte *)png_malloc(png_ptr, 8);
-> _synth[8] = 0xCC;            /* off-by-one heap-buffer-overflow */
-> png_free(png_ptr, _synth);
-> ```
->
-> The bug fires whenever the parser dispatches a `tEXt` chunk. None of our six seeds contains `tEXt`, so the fuzzer must construct the 4-byte chunk-type token to reach it.
->
-> AFL++ saved its first crash 17 seconds into the 60-second run (after 7,616 executions). The triggering input was 111 bytes; `afl-tmin` reduced it to **16 bytes** — the PNG signature plus a single chunk header `length=0x30303030, type=tEXt` and no chunk data:
->
-> ```
-> 89 50 4E 47 0D 0A 1A 0A   PNG signature
-> 30 30 30 30               chunk length (any value works)
-> 74 45 58 74               chunk type "tEXt"  ← from png.dict
-> ```
->
-> ASan reports `heap-buffer-overflow WRITE of size 1` at `pngrutil.c:2027`, located *0 bytes after* the 8-byte heap region allocated by `png_malloc_default` at `pngmem.c:511` — exactly the off-by-one we injected. The full call chain (Figure A.2) is `main (harness.c:46) → png_read_info (pngread.c:537) → png_handle_tEXt (pngrutil.c:2027)`.
->
-> The `tEXt` token came from `png.dict`; the fuzzer cannot construct that 4-byte string by random bit flips at any tractable rate (1 in 2³² per byte position). This validates four properties of the setup simultaneously: (1) the harness is reachable, (2) ASan instrumentation catches small heap overflows, (3) the dictionary contributes coverage that random mutation cannot, (4) `afl-tmin` produces a minimal, unambiguous proof-of-concept.
->
-> No real crashes were found because libpng 1.2.56 is well-tested at the depths our 30-min run reached (~27 % reachable-edge coverage, near-saturation by minute 20). Bugs in this version live deeper in the chunk-handler tree (`tEXt`/`iTXt`/`zTXt`, `sCAL`, `sBIT`) — reachable in principle but requiring longer wall-clock time or seeds that already contain ancillary chunks. The synthetic experiment shows that *if* the campaign had reached `png_handle_tEXt` and a real bug existed there, the toolchain would have caught it within seconds.
+> | Strategy | Paths / Execs | Notes |
+> |---|---|---|
+> | havoc/splice | [TODO] | |
+> | bit/byte flips | [TODO] | |
+> | arithmetic | [TODO] | |
+> | dictionary | [TODO] | |
 
 ---
 
-## Q7 — Binary-only fuzzing with QEMU mode (5 pts)
+## Q4 — Campaign analysis
 
-> **Binary-only fuzzing with QEMU mode.** We re-ran the same harness against a vanilla-gcc build of libpng (no instrumentation, no sanitizer; CRC patch retained so both campaigns explore comparable parser paths) under `afl-fuzz -Q`, with everything else identical.
+> **Instrumented WAV campaign — [X]-min run.**
+>
+> | Field | Value |
+> |---|---|
+> | run_time | [TODO] |
+> | execs_done | [TODO] |
+> | execs_per_sec | [TODO] |
+> | corpus_count | [TODO] |
+> | edges_found | [TODO] |
+> | bitmap_cvg | [TODO] % |
+> | stability | [TODO] % |
+> | cycles_done | [TODO] |
+> | saved_crashes | [TODO] |
+>
+> [Interpret edges-vs-time curve: initial ramp / ADPCM exploration / plateau.]
+> [Discuss stability: 100 % confirms harness determinism.]
+
+---
+
+## Q5 — Crash triage
+
+> **Crash triage.** The [X]-min instrumented WAV campaign found [N] crash(es).
+>
+> [If crashes found:]
+> We selected the earliest crash (`id:000000,…`) for triage. Reproduction:
+> `./sdl_wav_fuzz findings/default/crashes/id:000000,…` prints an ASan
+> `heap-buffer-overflow` abort. We minimized the input with `afl-tmin`:
+> the original [X]-byte file reduced to [Y] bytes — a RIFF envelope with a
+> `fmt ` chunk setting `wFormatTag=0x0002` (MS-ADPCM) and `nBlockAlign=[Z]`,
+> followed by a single `data` block. This maps to **CVE-2019-7575**:
+> `MS_ADPCM_decode` in `audio/SDL_wave.c` computes the output buffer size
+> from `nBlockAlign` and `wSamplesPerBlock` without bounds-checking the
+> result, then writes [Z] bytes beyond the end of the allocation.
+>
+> ASan stack trace (abbreviated):
+> ```
+> WRITE of size 2 at offset [N] of [M]-byte region
+>   #0 MS_ADPCM_decode (SDL_wave.c:[LINE])
+>   #1 SDL_LoadWAV_RW  (SDL_wave.c:[LINE])
+>   #2 main            (harness_wav.c:[LINE])
+> ```
+>
+> [If no crashes found — unexpected but handled:]
+> The campaign found no crashes. This is unexpected given the known CVEs in
+> SDL 1.2.15. Possible explanations: [runtime too short / ADPCM paths not
+> reached / SDL version used has a backported fix]. We extended the run to
+> [Y] hours; alternatively, run with the BMP harness targeting
+> CVE-2019-7637 (SDL_FillRect heap overflow).
+
+---
+
+## Q6 — Attack surface
+
+> **Attack surface.** SDL 1.2.15 is used by thousands of games, emulators,
+> and media players as their primary platform-abstraction layer. Two
+> representative deployments with high attacker-controlled input exposure:
+>
+> **1. Game engines / emulators (e.g., DOSBox, ScummVM).**  
+> These applications call `SDL_LoadWAV` or `SDL_LoadWAV_RW` on audio assets
+> that may be loaded from user-supplied game data directories, mod archives,
+> or downloaded content. An attacker who can influence the `.wav` files in a
+> game's asset bundle — via a malicious mod, a compromised CDN, or a
+> man-in-the-middle on an unencrypted asset download — can trigger the ADPCM
+> heap overflows and gain arbitrary-write primitives in the game process.
+>
+> **2. Media players using SDL 1.2.x (e.g., older MPlayer builds, custom
+> kiosk/embedded players).**  
+> Players that accept user-supplied audio files as command-line arguments or
+> via a file-picker directly call `SDL_LoadWAV` on attacker-controlled
+> content. No user interaction beyond "open file" is required to trigger the
+> bug.
+>
+> **Code paths our harness does not exercise:**
+>
+> 1. `SDL_mixer` (`Mix_LoadWAV`, `Mix_LoadMUS`). SDL_mixer is a separate
+>    library that wraps SDL's audio subsystem and adds OGG, MP3, FLAC, and
+>    MIDI support. Our harness calls `SDL_LoadWAV_RW` directly and does not
+>    exercise the mixer layer. Bugs in `SDL_mixer`'s format dispatch or
+>    codec wrappers are invisible to our campaign.
+>
+> 2. SDL_net / SDL_image. SDL has companion libraries for networking and
+>    image loading. These are entirely separate from the core SDL audio/video
+>    code and are not reached by our harness.
+
+---
+
+## Q7 — QEMU comparison
+
+> **QEMU-mode campaign.**
 >
 > | Metric | Instrumented + ASan | QEMU mode | Δ |
 > |---|---|---|---|
-> | exec speed (last min) | 248 / sec | 313 / sec | +26 % |
-> | total execs | 448,119 | 592,842 | +32 % |
-> | corpus count | 515 | 597 | +16 % |
-> | cycles done | 1 | 3 | +200 % |
-> | edges_found | 827 / 3090 | 2245 / 65536 | (different denominators) |
-> | bitmap density (current) | 6.80 % | 0.76 % | −89 % |
-> | stability | 100 % | 100 % | — |
-> | saved crashes | 0 | 0 | — |
+> | exec speed (last min) | [TODO] / sec | [TODO] / sec | [TODO] |
+> | total execs | [TODO] | [TODO] | [TODO] |
+> | corpus count | [TODO] | [TODO] | [TODO] |
+> | cycles done | [TODO] | [TODO] | [TODO] |
+> | edges_found / denominator | [TODO] | [TODO] | — |
+> | stability | [TODO] % | [TODO] % | — |
+> | saved crashes | [TODO] | [TODO] | — |
 >
-> **Speed.** QEMU was 26 % faster than instrumented, contradicting the textbook 2 – 5× slowdown attributed to user-mode emulation. The dominant cost in our instrumented build is not the AFL++ probes but **AddressSanitizer**: every load/store goes through a shadow-memory check, and per-process fork pays a shadow-init cost. The QEMU binary has neither, and QEMU translates each basic block once into native code that is then cached — so for ~150-byte PNG inputs, steady-state emulation is cheaper than steady-state ASan.
->
-> **Edges.** The `edges_found` numbers are not directly comparable. Instrumented mode reports 827 against a denominator of 3090 — the count of compile-time PC-guard probes inserted by `afl-clang-fast` into source files we rebuilt (libpng + our harness; the precompiled `zlib` we link is excluded). QEMU reports 2245 against a denominator of 65536, which is just the AFL bitmap size — QEMU has no static notion of edge count and instruments every basic block it translates, **including basic blocks inside `libc`, `zlib`, and the dynamic linker**. QEMU's larger raw count therefore does not mean QEMU explored more of libpng; it reflects a broader instrumentation scope. The current bitmap density (6.80 % vs 0.76 %) tells the inverse story: instrumented mode lights up nearly 9× more distinct map slots within libpng's reachable space because its probes are at every CFG edge plus ASan callbacks, while QEMU's are at basic-block granularity only.
->
-> **Cycles.** QEMU completed 3 cycles vs instrumented's 1. AFL++ allocates havoc/splice budget per favored item proportionally to recent edge findings; QEMU's coarser feedback shrinks per-item budgets, so each cycle is shorter. The corpora ended at similar size (515 vs 597), but QEMU revisited its corpus three times in the same wall clock.
->
-> **Bug detection.** Both campaigns saved zero crashes. The instrumented run would have flagged any heap memory error at the moment it occurred (ASan signals on unsafe load/store); the QEMU run can only detect crashes that propagate to a signal (SIGSEGV, SIGABRT). Memory-safety bugs that corrupt heap silently are invisible to the QEMU campaign as configured. `AFL_USE_QASAN=1` partially closes this gap by hooking allocators at runtime, at additional speed cost — out of scope for this lab.
+> [Explain speed difference: ASan shadow-memory cost vs. QEMU BB-translation
+> cost. Explain denominator difference: compile-time edge count vs. AFL bitmap
+> size. Explain crash detection gap: ASan catches silent overflows; QEMU mode
+> only sees signal-raising crashes.]
 
 ---
 
-## Q8 — Instrumentation depth and performance (5 pts)
+## Q8 — Instrumentation depth and performance
 
-### Q8 numbers from the three perf runs
-
-| Config | Build | Edges (`AFL_DEBUG=1`) | Exec/sec | Execs in 30 s | Stability |
-|---|---|---|---|---|---|
-| (1) no sanitizer + fork | `png_fuzz_no_san` | 3082 | 408.6 | 12,100 | 100.00 % |
-| (2) ASan + fork *(main)* | `png_fuzz` | 3085 | 248.2 | ~7,450 | 100.00 % |
-| (3) ASan + persistent | `png_fuzz_persistent` | 3099 | 34,100 | 977,000 | 99.78 % |
-
-> **Q8 — Instrumentation depth and performance.**
+> **Edge counts (`AFL_DEBUG=1`):**
 >
-> **Edge counts at startup** (reported by `AFL_DEBUG=1`):
-> - libpng alone (link with `-Wl,--whole-archive` against a trivial `int main(){return 0;}`): **4449** edges.
-> - Final harness binary `png_fuzz`: **3085** edges.
->
-> The harness has *fewer* edges than the library because static linking with `--disable-shared` lets the linker drop object files our harness never references — libpng's encoder, writers, and ancillary helpers (`pngwrite.c`, `pngwio.c`, `pngwutil.c`, `pngerror.c` paths only triggered on writes) are silently dropped. The 1364-edge gap is exactly the "could-reach but doesn't" delta. The reachable upper bound for our campaign is therefore 3085, not 4449.
->
-> **Map density vs reachable edges.** End of the 30-min instrumented campaign: `edges_found = 827 / 3090` (the AFL++ runtime saw 3090 instrumented edges, three more than `AFL_DEBUG=1` reports — those are AFL's own startup callbacks). 827 / 3085 ≈ 26.8 % of harness-reachable edges. Current bitmap density 6.80 % corresponds to ~4456 distinct map slots, giving an average of 1.44 transitions per static edge — most edges are reached via multiple predecessors. Edges *not* reached fall into three buckets: (a) error paths that fire only on specific malformed inputs (`png_error` callbacks for chunk-validation failures we never trigger), (b) ancillary chunk handlers we don't reach in 30 min via dictionary mutation, and (c) compile-time-conditional code paths (`PNG_USER_LIMITS_SUPPORTED`, `PNG_READ_iCCP_SUPPORTED`, etc.).
->
-> **Three-configuration exec speed**:
->
-> [insert Q8 table above]
->
-> The headline is the **137× speedup from persistent mode** (config 3 vs config 2). Two effects compound:
->
-> 1. **Fork elimination.** Fork mode `fork()`s a child process for every testcase, which is a syscall (~50 µs on Linux) plus per-process page-table setup plus ASan shadow-memory init. Persistent mode loops 10,000 iterations *inside* a single process via `__AFL_LOOP(10000)`; AFL++ feeds each new testcase via shared memory (`__AFL_FUZZ_TESTCASE_BUF`).
-> 2. **No syscalls in the inner loop.** The persistent body is just libpng running on a fresh buffer. For our ~150-byte PNG inputs, where libpng work is microseconds, fork overhead dominated all other costs in fork mode.
->
-> Removing ASan in fork mode (config 1 vs 2) gives a 1.65× speedup. ASan's shadow-memory check on every load/store is the underlying cost — modest but real, and well worth it for bug detection in the production campaign.
->
-> The cost of persistent mode is **stability**: 100.00 % in fork mode falls to 99.78 % in persistent. The 0.22 % drop is libpng global state leaking between iterations — zlib's deflate context, allocator caches, possibly stale `png_struct` lifetime invariants. AFL++ tolerates small stability dips, but accumulated noise would hurt a multi-hour campaign. We used fork + ASan for the main 30-min run precisely to keep stability at 100 % and make crash detection deterministic; persistent mode is the right choice when you specifically need throughput (e.g., regression testing a known harness or sweeping a fuzzed library across versions). Persistent also surfaced 76 timeouts in 30 s (vs 3 in the 30-min main run) — fast turnover finds slow inputs that fork mode rarely re-attempts.
->
-> Edge-count differences are explainable as instrumentation overhead, not coverage: ASan adds 3 callback edges (3082 → 3085), and the persistent-mode macros (`__AFL_FUZZ_INIT`, `__AFL_LOOP`, `__AFL_FUZZ_TESTCASE_*`) add 14 setup/teardown edges (3085 → 3099). None of these reflect user-visible code paths.
-
----
-
-## Q1 — Harness design (5 pts)
-
-> **Q1 — Harness design.** The harness (`src/harness.c`, ~70 lines) drives libpng's decoder pipeline against a single input file passed by AFL++ via the `@@` placeholder. The entry-point sequence is `png_create_read_struct → png_create_info_struct → png_init_io(file) → png_read_info → png_set_expand → png_set_strip_16 → png_set_gray_to_rgb → png_read_update_info → png_read_image → png_read_end`. We chose this surface for three reasons.
->
-> First, **decoder over encoder.** The realistic threat model is an attacker who controls a PNG image consumed by a viewer/browser/parser; encoding takes typed application data and produces bytes, so an attacker rarely controls the encoder's input. Bugs in the encoder exist (and were considered) but score lower in the security-impact dimension that drives Q6.
->
-> Second, **all transformations enabled.** `png_set_expand` pulls in the palette-expansion path, low-bit-depth-to-byte conversion, and `tRNS`-to-alpha promotion — historically the location of CVE-2015-8126 (PLTE overflow) and many similar palette-related bugs. `png_set_strip_16` exercises 16-bit-to-8-bit downconversion and its arithmetic. `png_set_gray_to_rgb` exercises grayscale-to-RGB lane expansion. Every one of these calls opens code that the parser otherwise skips, so they materially widen the reachable surface — visible as the 26.76 % bitmap coverage in 30 min.
->
-> Third, **alternatives rejected.** The simplified API `png_image_begin_read_from_memory` only exists in libpng 1.6+ and would not work on our 1.2.56 target. The low-level chunk reader (`png_read_chunk_header`, `png_push_read_chunk` from the progressive API) covers smaller surface and would skip the IDAT decompression and filter-reconstruction code where most historical CVEs live. The encoder API was rejected on threat-model grounds (above). We did consider the progressive-read API (`png_process_data`) — it is a real and interesting target (browsers use it for streamed decoding) — but it requires a more elaborate harness that feeds chunks incrementally, and the lab time budget didn't justify a second harness for what is largely the same parser code reached via a different driver.
->
-> **Data-flow walkthrough.** AFL++ writes the mutated input to a temporary file and passes the path as `argv[1]`. The harness opens it (`fopen(argv[1], "rb")`), creates the libpng read structures, registers a `setjmp` site on `png_jmpbuf(png)` so libpng's error path (which signals failures via `longjmp`) returns to our cleanup block instead of aborting the process, then drives the decode pipeline. On clean completion the harness frees row buffers, destroys read structures, closes the file, and returns 0.
->
-> **Guards, each justified from a fuzzing perspective:**
->
-> | Guard | Purpose |
-> |---|---|
-> | `argc < 2` → return 1 | Defensive only; AFL always passes a path. Not a real fuzzing concern, but exiting cleanly avoids unhandled-argv crashes if a reviewer runs the binary by hand. |
-> | `fopen() == NULL` → return 0 | If AFL fails to write a file (out of disk, permission), libpng's `png_init_io(NULL)` would dereference the FILE pointer. Returning 0 instead lets the campaign continue. |
-> | `png_create_read_struct == NULL` and `png_create_info_struct == NULL` | Allocator failures are not bugs in libpng. Treating them as crashes would conflate OOM with parser bugs. |
-> | **`setjmp(png_jmpbuf(png))` cleanup branch** | Without this, every malformed input that triggers `png_error` aborts the process. AFL would record every malformed input as a unique crash and the report would drown in false positives. The campaign found 3 timeouts but 0 saved crashes precisely because this catch works. |
-> | `width/height == 0` or `> 4096` → `png_error` | A mutated IHDR can claim dimensions up to 2³² each. libpng would call `malloc(width × height × bytes_per_pixel)` and the libc OOM-kill would surface as a SIGABRT — *not* a parser bug. The 4096 cap rejects implausible images cheaply (most real photos are <16k×16k); we route the rejection through `png_error` so cleanup runs identically to a real parse failure. |
-> | `volatile` on `rows` and `rows_alloc` | C semantics: pointers modified between `setjmp` and the corresponding `longjmp` must be `volatile`, otherwise the compiler is allowed to keep them in registers and the longjmp-driven cleanup branch may see stale values. Skipping `volatile` produces use-after-free or double-free on the cleanup path under optimization. |
-> | Per-row `malloc == NULL` → `png_error` | Row buffers can be megabytes for large images. We let `png_error` route into the cleanup branch so partially-allocated state is freed correctly. |
->
-> The harness binary at `AFL_DEBUG=1` reports 3085 instrumented edges; the libpng static archive linked under `-Wl,--whole-archive` reports 4449 — the 1364-edge gap is encoder, writer, and ancillary helper code that the static linker correctly omits.
-
----
-
-## Q2 — Instrumentation and sanitizers (5 pts)
-
-> **Q2 — Instrumentation and sanitizers.** The instrumented build uses `afl-clang-fast` with `CFLAGS="-fsanitize=address -g -O1"` and `LDFLAGS="-fsanitize=address"`, configured with `--disable-shared`. Two patches are applied to libpng: the AFL++-shipped `libpng-nocrc.patch` for the production campaign, and a separate `synthetic_bug.patch` only for the Q5 demonstration build.
->
-> | Flag/patch | What it does | Effect of omitting it |
+> | Binary | Edges | Built with |
 > |---|---|---|
-> | `CC=afl-clang-fast` | Drop-in clang wrapper that injects a PC-guard probe at every basic-block entry. The probes feed AFL++'s coverage bitmap. | Without compile-time instrumentation the binary has no coverage feedback. AFL would still run but degenerate to blind random fuzzing — equivalent to `-Q` mode (QEMU) with all of QEMU's overhead and none of its instrumentation. |
-> | `-fsanitize=address` (CFLAGS + LDFLAGS) | AddressSanitizer: shadow-memory checks on every load/store, malloc/free hooks, redzones around heap allocations, stack-buffer-overflow detection. | Memory-safety bugs that don't crash on a signal go silent. Heap-buffer-overflow by 1 byte (our synthetic Q5 bug) does not segfault — it corrupts adjacent metadata. ASan turns it into an immediate diagnosable abort. |
-> | `-g` | Embed DWARF debug symbols. | `llvm-symbolizer` (called by ASan at crash time) cannot map crash addresses to file:line:col. Stack traces become hex-only and triage gets much harder. |
-> | `-O1` | Modest optimization: inlines tiny functions, removes obvious dead code. | `-O0` slows execution ~2–3× because every variable lives in memory and every operation hits the stack — costly for fuzzing. `-O2`/`-O3` aggressively inline ASan callbacks and CFG edges, which can collapse distinct edges into one and reduce coverage signal. `-O1` is the AFL++-recommended sweet spot. |
-> | `--disable-shared` | Static linking only; produces `libpng12.a`, no `libpng12.so`. | Shared-library linking forces runtime `LD_LIBRARY_PATH` configuration, complicates the fork server's `dlopen`-driven setup, and prevents the static linker from dropping unreferenced object files (encoder, writers) — the harness binary would balloon and accumulate unused-but-instrumented edges that dilute coverage signal. |
-> | `libpng-nocrc.patch` | Modifies `png_crc_finish()` in `pngrutil.c` so CRC verification is skipped (returns 0 unconditionally instead of comparing the computed CRC-32 against the chunk's stored CRC). | Every chunk in a PNG ends with a CRC-32 over `Type+Data`. When AFL mutates a single byte inside a chunk's data, the CRC no longer matches. Without the patch, libpng's default behavior is to call `png_error` on critical chunks (IHDR/PLTE/IDAT/IEND — campaign aborts on the chunk early) and silently discard ancillary chunks (mutations to `tEXt`/`gAMA`/etc. just vanish). Either way the deeper parsing code never executes; coverage plateaus within minutes and the fuzzer wastes its budget producing inputs that never reach the parser. The libpng walkthrough's "CRC and fuzzing" callout is explicit about this — patching is mandatory for effective libpng fuzzing. |
-> | `synthetic_bug.patch` (Q5 only) | Inserts a 1-byte heap overflow into `png_handle_tEXt`. Used only in the layered `cs412-fuzz-synthetic` image to demonstrate the toolchain catches bugs end-to-end. Not applied in the main campaign. | Without it the production campaign found no real crashes (libpng 1.2.56 is well-tested at our depth) and Q5's "if no crashes, prove your setup works" branch would have nothing to demonstrate. |
+> | `sdl_wav_fuzz` | [TODO] | afl-clang-fast + ASan + fork |
+> | `sdl_wav_fuzz_no_san` | [TODO] | afl-clang-fast + fork (no ASan) |
+> | `sdl_wav_fuzz_persistent` | [TODO] | afl-clang-fast + ASan + persistent |
+> | SDL alone (whole-archive) | [TODO] | afl-clang-fast over libSDL.a |
 >
-> The QEMU-mode build differs in three flags: `CC=gcc` (no compile-time instrumentation), no `-fsanitize=address` in CFLAGS or LDFLAGS, and the same `--disable-shared` plus `libpng-nocrc.patch`. Keeping the CRC patch in the QEMU build is a deliberate methodology choice (see Q7): in a real binary-only scenario you couldn't patch out the checksum, but our goal is to compare exec speed and coverage between the two modes on *the same code paths*. Without the patch in QEMU, the QEMU campaign would explore CRC-rejection code paths that the instrumented campaign skips, and the comparison would conflate two effects (instrumentation cost vs path divergence). The libpng walkthrough explicitly endorses this choice.
-
----
-
-## Q6 — Attack surface analysis (5 pts)
-
-> **Q6 — Attack surface analysis.** libpng is the reference C implementation of the PNG standard and is the dominant PNG decoder in the open-source ecosystem. We focus on two real-world deployments where attacker-controlled PNGs reach libpng with high probability:
+> **Three-config exec speed:**
 >
-> **Chromium image-decoding pipeline.** `third_party/libpng` ships in every Chromium release (and downstream — Edge, Brave, Opera). When the user navigates to a page with an `<img>` tag, the browser process delegates decoding to a sandboxed renderer or utility process, which calls into libpng to parse the bytes. A heap-corruption bug in libpng reachable from the standard read pipeline becomes a **renderer-process arbitrary-write primitive**, exploitable as the first step of a sandbox-escape chain. The attack scenario: an attacker hosts `https://attacker.example/exploit.png`, an unwitting user navigates there (or to any site that includes an attacker-controlled image — ad networks, user-content sites, content-injection in third-party trackers), the browser calls libpng, the bug fires, and the attacker has code execution in the renderer. Browser exploitation chains have repeatedly leveraged image-decoder bugs (e.g., libwebp CVE-2023-4863 in 2023 was exploited in the wild via this exact path).
+> | Config | Edges | Exec/sec | Execs in 30 s | Stability |
+> |---|---|---|---|---|
+> | (1) no ASan + fork | [TODO] | [TODO] | [TODO] | [TODO] % |
+> | (2) ASan + fork (main) | [TODO] | [TODO] | [TODO] | [TODO] % |
+> | (3) ASan + persistent | [TODO] | [TODO] | [TODO] | [TODO] % |
 >
-> **ImageMagick / `coders/png.c`.** ImageMagick is a server-side image-processing toolkit used by countless web apps for thumbnailing, format conversion, and metadata stripping on user uploads. `convert input.png output.jpg` calls libpng under the hood. Any file-upload endpoint that processes images server-side (Discourse, Mastodon, GitHub Issues, Slack file uploads, Discord attachments) is a candidate for libpng exposure. The attack scenario: an attacker uploads `exploit.png` to a service, the server invokes ImageMagick, libpng is called, and a memory bug becomes a **server-side RCE primitive** — typically more privileged than a renderer-side bug because the server process has filesystem/network access. ImageTragick (CVE-2016-3714) was a similar class of vulnerability; downstream image libraries are routinely the weakest link in upload pipelines.
->
-> **Code paths our harness does not exercise.**
->
-> 1. **Progressive / streamed reading via `png_process_data`** (`pngpread.c`). Browsers don't buffer an entire PNG before decoding; they call `png_process_data` with bytes as they arrive over the network. The progressive path has its own state machine, its own chunk-buffering logic, and does not share code with the synchronous `png_read_*` family we drive. A bug that only triggers when chunk boundaries fall at specific byte offsets (a real failure mode for streamed parsers) would be invisible to our harness but reachable in Chromium. Our harness misses this entirely.
->
-> 2. **Post-`png_read_end` ancillary chunks and user chunk callbacks.** PNG allows ancillary chunks (`tIME`, `tEXt`, `iTXt`, custom application chunks) *after* IDAT, before IEND. Applications that register custom chunk handlers via `png_set_read_user_chunk_fn` (anything that uses private metadata — color-management software like Krita, application-specific PNG extensions) execute code paths our harness never touches: we drive the standard pipeline through `png_read_end` and exit. A user-chunk handler bug, or a bug in libpng's dispatch of post-IDAT ancillary chunks, would slip past our coverage. The encoder path (`png_write_*`) is a related blind spot — less attacker-controlled, but used by image-generation services that synthesize user-supplied data into PNG outputs.
->
-> Both gaps matter because real attack scenarios depend on how the *application* drives libpng, not just on which libpng functions exist. A hardened harness for production fuzzing of libpng would maintain at least three drivers — synchronous read (ours), progressive read, and a write/encoder path — plus seed corpora derived from each consumer (Chromium image cache, ImageMagick test suite). The 26.76 % edge coverage we achieve reflects one such driver; the missing 73 % is partly unreachable from our entry points by design.
-
----
-
-## Notes (Q1/Q2/Q6 above; remaining items)
-
-- **Q1**: walk through `src/harness.c` data-flow. Justify each guard:
-  - `setjmp` catch — without it, `png_error → longjmp` crashes process → false positives drown report
-  - dimension cap (4096 × 4096) — prevents OOM-kill being misreported as a crash
-  - `volatile` on row pointers — required because longjmp clobbers register-cached values
-  - alternatives rejected: encoder (attacker rarely controls encode input), low-level chunk reader (smaller surface), simplified API (not in 1.2.56)
-- **Q2**: list every flag from `Dockerfile`:
-  - `-fsanitize=address -g -O1` (instrumented), `-g -O1` (vanilla, QEMU)
-  - `--disable-shared` (static linking; avoids `LD_LIBRARY_PATH` issues, lets static linker drop unreferenced object files for smaller harness binary)
-  - `CC=afl-clang-fast` (compile-time probes) vs `CC=gcc` (no probes; QEMU adds them at runtime)
-  - patches: `libpng-nocrc.patch` (without it, every chunk mutation fails CRC validation → `png_error` → coverage plateaus immediately on critical chunks, mutated data discarded on ancillary chunks)
-- **Q6**: real-world apps using libpng:
-  - Chromium image decoding pipeline (`third_party/libpng` in the source tree; runs on every PNG a user opens — favicons, inline images, etc.)
-  - ImageMagick (`coders/png.c` calls libpng to decode PNGs in batch image-processing pipelines, often server-side; exposed to attacker-uploaded images)
-  - Two code paths our harness misses: progressive/streamed reading via `png_process_data` (used by browsers for partial decoding), and post-IDAT ancillary chunks past `png_read_end` (e.g., `iTXt` after the image data; we stop at `png_read_end` so we miss any handlers that run there). Both gaps matter because real applications often *do* exercise these paths and bugs there would be missed by our harness.
-- **Q8**:
-  - Library-alone count (4449) > harness count (3085) because the static linker drops unreferenced object files (encoder, writers, helpers) — see `--whole-archive` experiment in NOTES.md
-  - Map density 6.80 % × 65536 = 4456 distinct bitmap slots; 4456 / 3085 = 1.44 transitions per static edge on average → most edges are reached via multiple predecessors, indicating the fuzzer hit the same blocks from varied control-flow histories
-  - Three-config exec speeds (TODO: run `make fuzz-no-san TIME=30` and `make fuzz-persistent TIME=30`):
-    - Expected order: persistent > no-san fork > asan fork
-    - Persistent gain: skips fork() per testcase, reuses process state
-    - ASan slowdown: shadow-memory check on every load/store
-    - Fork-elimination saves a syscall (~50 µs) plus the shadow-init cost
+> [Explain persistent-mode speedup: fork elimination, shared-memory buffer,
+> no shadow-init per iteration. Explain ASan overhead: shadow-memory check on
+> every load/store. Explain stability drop in persistent mode if observed:
+> SDL global state leaking between iterations.]
