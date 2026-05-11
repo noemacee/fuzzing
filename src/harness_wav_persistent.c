@@ -1,6 +1,7 @@
 #include "SDL.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 /* Persistent-mode WAV harness for Q8 exec-speed comparison.
  *
